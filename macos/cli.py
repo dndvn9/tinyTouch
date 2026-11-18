@@ -9,6 +9,7 @@ from contextlib import contextmanager
 import difflib
 import getpass
 import hashlib
+import hmac
 import json
 import os
 import platform
@@ -455,7 +456,7 @@ def authorize_macos() -> None:
 def prepare_hid_password() -> None:
     """Capture the HID password and unlock Keychain without requiring sudo."""
     global _setup_password
-    entered = bytearray(getpass.getpass("Mac password: ").encode("utf-8"))
+    entered = bytearray(password_input("Mac password: ").encode("utf-8"))
     if not entered:
         raise ToolError("HID mode requires the password for this Mac.")
     try:
@@ -524,7 +525,26 @@ def notify(title: str, message: str) -> None:
     )
 
 
+def gui_input(prompt: str, *, hidden: bool = False) -> str:
+    field = " with hidden answer" if hidden else ""
+    script = ('on run argv\nreturn text returned of (display dialog (item 1 of argv) '
+              'with title "tinyTouch" default answer ""' + field + ')\nend run')
+    result = subprocess.run(["/usr/bin/osascript", "-e", script, "--", prompt],
+                            text=True, capture_output=True)
+    if result.returncode:
+        raise ToolError("Dialog cancelled.")
+    return result.stdout.removesuffix("\n")
+
+
+def password_input(prompt: str) -> str:
+    if os.environ.get("TINYTOUCH_GUI") == "1":
+        return gui_input(prompt, hidden=True)
+    return getpass.getpass(prompt)
+
+
 def ask(prompt: str) -> str:
+    if os.environ.get("TINYTOUCH_GUI") == "1":
+        return gui_input(prompt).strip()
     try:
         return input(prompt).strip()
     except EOFError as exc:
@@ -1243,7 +1263,7 @@ def hid_pairing_key(value: str | None) -> bytes:
     if value is None:
         raise HidSetupIncompleteError("This Mac has no saved HID pairing key. Run 'tinytouch setup --mode hid'.")
     try:
-        key = bytes.fromhex(value.strip())
+        key = bytes.fromhex(value.removeprefix("live1:").strip())
     except ValueError as exc:
         raise HidSetupIncompleteError("The saved HID pairing key is invalid. Run 'tinytouch setup --mode hid'.") from exc
     if len(key) != 32:
@@ -1273,8 +1293,8 @@ def prompt_hid_password() -> str:
     with warnings.catch_warnings():
         warnings.simplefilter("error", getpass.GetPassWarning)
         try:
-            first = getpass.getpass("Password: ")
-            second = getpass.getpass("Password again: ")
+            first = password_input("Password: ")
+            second = password_input("Password again: ")
         except (getpass.GetPassWarning, EOFError) as exc:
             raise ToolError("Run this command in an interactive terminal.") from exc
     if not first or first != second:
@@ -1383,6 +1403,37 @@ def command_keyboard_layout(args: argparse.Namespace) -> None:
     say(f"HID keyboard layout saved: {args.layout}.")
 
 
+def add_wrapped_host(port: str, key: bytes) -> None:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    curve = ec.SECP256R1()
+    private = ec.generate_private_key(curve)
+    public = private.public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+    )
+    lines = serial_command(port, f"PAIR OPEN {public.hex()}", timeout=8)
+    match = re.fullmatch(r"OK PAIR OPEN (04[0-9a-f]{128})", lines[-1] if lines else "")
+    if not match:
+        raise ToolError("Invalid pairing response from tinyTouch.")
+    remote = bytes.fromhex(match[1])
+    try:
+        peer = ec.EllipticCurvePublicKey.from_encoded_point(curve, remote)
+    except ValueError as exc:
+        raise ToolError("Invalid device pairing key.") from exc
+    shared = private.exchange(ec.ECDH(), peer)
+    wrap = hashlib.sha256(b"tinyTouch host pairing v1" + public + remote + shared).digest()
+    identifier = bytes.fromhex(host_id(key))
+    iv = secrets.token_bytes(12)
+    packet = identifier + iv + AESGCM(wrap).encrypt(iv, key, identifier)
+    lines = serial_command(port, f"PAIR FINISH {packet.hex()}", timeout=40,
+                           touch_prompt="Touch tinyTouch to register this Mac.")
+    expected = "OK PAIR FINISH " + hmac.digest(key, packet, "sha256").hex()
+    if not lines or not hmac.compare_digest(lines[-1], expected):
+        raise ToolError("The device did not confirm the registered key.")
+
+
 def configure_hid(port: str, device: dict[str, str]) -> None:
     global _setup_password
     account = device_account(port)
@@ -1406,9 +1457,12 @@ def configure_hid(port: str, device: dict[str, str]) -> None:
         registered, capacity = host_list(port)
         if identifier not in registered and len(registered) >= capacity:
             raise ToolError("This device has no available HID computer slot. Remove a registered computer before adding another.")
-        if not valid_saved_key:
+        wrapped = device.get("pair_wrap") == "1"
+        if saved_key and saved_key.startswith("live1:") and not wrapped:
+            raise ToolError("This pairing requires firmware with live device proof.")
+        if not valid_saved_key or (wrapped and not (saved_key or "").startswith("live1:")):
             written.append(PAIRING_SERVICE)
-            keychain_set(PAIRING_SERVICE, account, key.hex())
+            keychain_set(PAIRING_SERVICE, account, ("live1:" if wrapped else "") + key.hex())
         saved_password = previous[PASSWORD_SERVICE]
         if not saved_password or len(saved_password.encode("utf-8")) > 160:
             written.append(PASSWORD_SERVICE)
@@ -1416,7 +1470,12 @@ def configure_hid(port: str, device: dict[str, str]) -> None:
         if identifier not in registered:
             # A timeout can occur after the device saves the host.
             added = identifier
-            serial_command(port, f"HOST ADD {identifier} {key.hex()}", timeout=4)
+            if device.get("pair_wrap") == "1":
+                add_wrapped_host(port, key)
+            elif os.environ.get("TINYTOUCH_GUI") == "1":
+                raise ToolError("Upgrade firmware before pairing this Mac in HID mode.")
+            else:
+                serial_command(port, f"HOST ADD {identifier} {key.hex()}", timeout=4)
         verify_hid_host(port, status(port), account)
     except (Exception, KeyboardInterrupt) as exc:
         cleanup_failed = False
@@ -1693,7 +1752,7 @@ def command_setup(args: argparse.Namespace) -> None:
     port = choose_port(args.port)
     # HID reconfiguration pauses the helper through its foreground lease.
     # Keep that service available if device validation or password entry fails.
-    if mode == "piv":
+    if mode == "piv" and os.environ.get("TINYTOUCH_GUI") != "1":
         remove_helper()
     piv_rescan_needed = False
     created_piv_identities = None
@@ -1716,13 +1775,16 @@ def command_setup(args: argparse.Namespace) -> None:
                 and device.get("mode") == "piv"
                 and device.get("piv") == "ready"
                 and int(device.get("fingerprints", "0")) > 0
-                and paired_piv_identities()
+                and (device["piv_id"].upper() in user_piv_identities()
+                     if device.get("piv_id") else paired_piv_identities())
             ):
                 say("PIV setup is already complete on this Mac.")
                 explain_piv_pin()
                 return
             if mode == "hid" and not hid_configured:
                 expected_account = device_account(port)
+                if device.get("pair_wrap") == "1" and device.get("fingerprints") == "0":
+                    enroll(port, args.skip_enroll)
                 unlock(port, reason="configure HID mode")
                 configure_hid(port, device)
                 hid_configured = True
@@ -1791,6 +1853,7 @@ def command_setup(args: argparse.Namespace) -> None:
     if mode == "piv" and not args.no_pair:
         pair_args = argparse.Namespace(**vars(args))
         pair_args.port = port
+        pair_args.piv_id = device.get("piv_id")
         command_pair(
             pair_args,
             identities=created_piv_identities,
@@ -2085,7 +2148,7 @@ def command_computers(args: argparse.Namespace) -> None:
         local = keychain_get(PAIRING_SERVICE, account)
         if local:
             try:
-                if host_id(bytes.fromhex(local)) == identifier:
+                if host_id(bytes.fromhex(local.removeprefix("live1:"))) == identifier:
                     keychain_delete(PAIRING_SERVICE, account)
             except ValueError:
                 pass
@@ -2537,6 +2600,25 @@ def wait_for_piv_identities(
     return [], []
 
 
+def pair_in_login_session(identity: str, timeout: float = 120.0) -> None:
+    """Let the logged-in user pair a card, then verify the exact account binding."""
+    say(f"In the macOS pairing dialog select tinyTouch PIV Authentication ({identity}).")
+    say("Keep the device connected. Touch the registered finger when tinyTouch requests it.")
+    run(["/usr/sbin/sc_auth", "pairing_ui", "-f"], text=True, capture_output=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        if identity.upper() in user_piv_identities():
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ToolError(
+                "macOS has not paired the selected tinyTouch with this account. "
+                "If several cards are connected, unplug the other cards and retry setup. "
+                "Complete the system pairing dialog and approve the requested touch."
+            )
+        time.sleep(min(1.0, remaining))
+
+
 def command_pair(
     args: argparse.Namespace,
     *,
@@ -2547,6 +2629,16 @@ def command_pair(
     port = choose_port(args.port)
     prepare_piv_discovery(port)
     paired, available = identities or wait_for_piv_identities()
+    target = getattr(args, "piv_id", None)
+    if target:
+        target = target.upper()
+        if target in user_piv_identities():
+            say("PIV is already paired with this user.")
+            explain_piv_pin()
+            return
+        if target not in [item.upper() for item in paired + available]:
+            raise ToolError("macOS has not detected the selected tinyTouch identity.")
+        paired, available = [], [target]
     if paired:
         say("PIV is already paired with this Mac.")
         explain_piv_pin()
@@ -2569,7 +2661,9 @@ def command_pair(
         identity = available[0]
     # Obtain sudo first, then grant fresh device presence. Enrollment and a
     # terminal password prompt can outlive firmware's short PIV authorization.
-    authorize_macos()
+    graphical = os.environ.get("TINYTOUCH_GUI") == "1"
+    if not graphical:
+        authorize_macos()
     # Selecting an identity or entering the macOS password can outlast the
     # discovery window. Reopen first, then grant presence after the USB reset.
     reopened = prepare_piv_discovery(port, refresh=True)
@@ -2587,10 +2681,15 @@ def command_pair(
     else:
         # Refresh authorized a card that was already visible, without a reset.
         explain_piv_pin()
+    if graphical:
+        pair_in_login_session(identity)
+        say("PIV pairing with this Mac is complete.")
+        return
     keychain_warning = False
     try:
+        command = ["sudo", "-n", "sc_auth", "pair", "-u", getpass.getuser(), "-h", identity]
         result = run(
-            ["sudo", "-n", "sc_auth", "pair", "-u", getpass.getuser(), "-h", identity],
+            command,
             text=True,
             capture_output=True,
         )
@@ -2965,7 +3064,7 @@ class FriendlyArgumentParser(argparse.ArgumentParser):
         suggestion = ""
         choice = re.search(r"invalid choice: '([^']+)' \(choose from (.+)\)", message)
         if choice:
-            candidates = re.findall(r"'([^']+)'", choice[2])
+            candidates = [item.strip(" '") for item in choice[2].split(",")]
             matches = difflib.get_close_matches(choice[1], candidates, n=1)
             if matches:
                 suggestion = f"Did you mean '{matches[0]}'?\n"
@@ -3256,6 +3355,12 @@ def main() -> int:
         helper_main()
         return 0
     args = parser().parse_args()
+    expected = os.environ.get("TINYTOUCH_GUI_DEVICE")
+    if expected and os.environ.get("TINYTOUCH_GUI") == "1":
+        from tinytouch_helper import device_endpoints
+        if not any(item.port == args.port and item.device_id == expected
+                   for item in device_endpoints()):
+            raise ToolError("Selected tinyTouch disconnected. Reconnect it and try again.")
     VERBOSE = args.verbose
     if args.command != "help" and (args.command or (sys.stdin.isatty() and sys.stdout.isatty())):
         show_startup_mark(args.command or "menu")

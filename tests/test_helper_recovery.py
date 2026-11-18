@@ -239,7 +239,38 @@ class WatchdogRecoveryTests(unittest.TestCase):
         self.assertEqual(len(connection.written), 2)
         connection.flush.assert_not_called()
 
-    def test_password_write_failure_does_not_consume_nonce(self):
+    def test_live_key_requires_current_device_proof_before_password(self):
+        self.check_live_proof(True)
+
+    def test_live_key_rejects_event_without_secure_input(self):
+        self.check_live_proof(False)
+
+    def check_live_proof(self, secure):
+        connection = Connection(Clock(), [b"OK STATUS protocol=6\n", event_frame()])
+
+        stop = threading.Event()
+
+        def respond(payload):
+            if payload.startswith(b"PROVE "):
+                challenge = payload.decode().strip().split(" ", 1)[1]
+                proof = helper.mac_hex(KEY, "PROVE|" + challenge)
+                connection.chunks.extend([b"PROOF " + b"0" * 64 + b"\n",
+                                          f"PROOF {proof}\n".encode()])
+
+        def check_secure_input():
+            if not secure:
+                stop.set()
+            return secure
+
+        connection.on_write = respond
+        with serving(connection), mock.patch.object(helper, "secure_keyboard_entry", side_effect=check_secure_input), mock.patch.object(
+            helper, "pairing_keychain_get", return_value=helper.LivePairingKey(KEY)
+        ):
+            helper.serve_port(PORT, once=True, stop_event=stop, device_id=DEVICE_ID)
+        self.assertEqual([line.split()[0] for line in connection.written],
+                         [b"STATUS", b"PROVE"] + ([b"PW"] if secure else []))
+
+    def test_password_write_failure_consumes_nonce_before_possible_partial_delivery(self):
         connection = Connection(Clock(), [b"OK STATUS protocol=6\n", event_frame()])
 
         def write(payload):
@@ -250,7 +281,7 @@ class WatchdogRecoveryTests(unittest.TestCase):
         with serving(connection) as (password, key, remember):
             with self.assertRaises(helper.serial.SerialTimeoutException):
                 helper.serve_port(PORT, once=True, device_id=DEVICE_ID)
-        remember.assert_not_called()
+        remember.assert_called_once()
         self.assertTrue(connection.closed)
         self.assertFalse(any(password))
         self.assertFalse(any(key))

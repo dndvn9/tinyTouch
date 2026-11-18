@@ -15,6 +15,26 @@ KEYCHAIN_WARNING = (
 
 
 class PivPairingTests(unittest.TestCase):
+    def test_login_session_waits_for_selected_identity(self):
+        with (
+            mock.patch.object(cli, "run") as invoke,
+            mock.patch.object(cli, "user_piv_identities",
+                              side_effect=[[OTHER_IDENTITY], [IDENTITY]]) as read,
+            mock.patch.object(cli.time, "sleep"),
+        ):
+            cli.pair_in_login_session(IDENTITY)
+        invoke.assert_called_once_with(["/usr/sbin/sc_auth", "pairing_ui", "-f"],
+                                       text=True, capture_output=True)
+        self.assertEqual(read.call_count, 2)
+
+    def test_login_session_rejects_other_card_at_timeout(self):
+        with (
+            mock.patch.object(cli, "run"),
+            mock.patch.object(cli, "user_piv_identities", return_value=[OTHER_IDENTITY]),
+            self.assertRaisesRegex(cli.ToolError, "has not paired"),
+        ):
+            cli.pair_in_login_session(IDENTITY, timeout=0)
+
     def setUp(self):
         self.args = SimpleNamespace(port="TT")
         self.enterContext(mock.patch.object(cli, "require_macos"))

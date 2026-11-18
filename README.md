@@ -180,6 +180,10 @@ The sensor supports up to ten fingers when it has 40 template slots.
 An occupied block requires replacement confirmation. `tinytouch delete 2`
 removes all views in block 2 after fingerprint approval.
 
+### Plug & Play Multi-Mac
+
+Install the SwiftUI Manager on each Mac and select **Set up this Mac** once per account. See the [Multi-Mac installation, pairing and upgrade guide](docs/customer/multi-mac.md).
+
 ### build from source
 
 The firmware project is `firmware/tiny_touch_unified`. It requires **ESP-IDF

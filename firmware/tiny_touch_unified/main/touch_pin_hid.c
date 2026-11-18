@@ -349,6 +349,34 @@ done:
   return ok;
 }
 
+bool touch_pin_hid_prove(const char *request, char result[65]) {
+  // Fixed-width host ID, device event nonce and a fresh host challenge.
+  if (strlen(request) != 82 || request[16] != ' ' || request[49] != ' ') return false;
+  for (size_t i = 0; i < 82; i++)
+    if (i != 16 && i != 49 && hex_value(request[i]) < 0) return false;
+  taskENTER_CRITICAL(&hid_transfer_lock);
+  bool pending = password_request_nonce[0] && !memcmp(password_request_nonce, request+17, 32);
+  taskEXIT_CRITICAL(&hid_transfer_lock);
+  if (!pending) return false;
+  device_hid_host_t hosts[DEVICE_CONFIG_MAX_HID_HOSTS];
+  size_t count = device_config_copy_hid_hosts(hosts);
+  char material[90], identifier[17];
+  uint8_t mac[32];
+  bool ok = false;
+  snprintf(material, sizeof(material), "PROVE|%s", request);
+  for (size_t i = 0; i < count; i++) {
+    bytes_to_hex(hosts[i].id, sizeof(hosts[i].id), identifier);
+    if (!memcmp(request, identifier, 16)) {
+      ok = hmac_sha256(hosts[i].key, material, mac);
+      if (ok) bytes_to_hex(mac, sizeof(mac), result);
+      break;
+    }
+  }
+  secure_wipe(mac, sizeof(mac));
+  secure_wipe(hosts, sizeof(hosts));
+  return ok;
+}
+
 static bool begin_password_request(const char *nonce, uint32_t session) {
   xQueueReset(password_responses);
   taskENTER_CRITICAL(&hid_transfer_lock);

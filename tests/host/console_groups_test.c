@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+static unsigned authorized_epoch;
+static unsigned host_pairing_epoch(void) { return 0; }
 static int64_t authorized_until;
 static bool serial_connected = true;
 static char last_reply[256];

@@ -12,6 +12,7 @@
 #include "mbedtls/pk.h"
 #include "mbedtls/rsa.h"
 #include "mbedtls/sha256.h"
+#include "mbedtls/sha1.h"
 #include "mbedtls/oid.h"
 #include "mbedtls/x509_crt.h"
 #include "nvs.h"
@@ -261,6 +262,20 @@ bool piv_create_identity(void) {
   if (!ok) return false;
   piv_reload_keys();
   return piv_uses_provisioned_keys();
+}
+
+// sc_auth identifies the public RSA key by the SHA-1 of its PKCS#1 DER.
+void piv_identity_hash(char out[41]) {
+  uint8_t encoded[512], digest[20];
+  unsigned char *end = encoded + sizeof(encoded);
+  out[0] = 0;
+  if (!piv_mutex) return;
+  xSemaphoreTake(piv_mutex, portMAX_DELAY);
+  int len = using_provisioned_keys ?
+      mbedtls_pk_write_pubkey(&end, encoded, &auth_key) : 0;
+  xSemaphoreGive(piv_mutex);
+  if (len <= 0 || mbedtls_sha1(end, len, digest) != 0) return;
+  for (size_t i = 0; i < sizeof(digest); i++) snprintf(out + 2*i, 3, "%02X", digest[i]);
 }
 
 bool piv_uses_provisioned_keys(void) {

@@ -86,6 +86,7 @@ export default defineConfig({
           { text: '1. Build', link: '/customer/build' },
           { text: '2. Install firmware', link: '/flash' },
           { text: '3. Setup', link: '/customer/setup' },
+          { text: 'Multi-Mac setup', link: '/customer/multi-mac' },
         ],
       },
       {

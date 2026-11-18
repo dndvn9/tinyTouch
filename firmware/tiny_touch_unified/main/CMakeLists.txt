@@ -2,6 +2,7 @@ idf_component_register(
   SRCS
     "main.c"
     "config_console.c"
+    "host_pairing.c"
     "device_config.c"
     "fingerprint.c"
     "finger_profiles.c"
@@ -12,7 +13,7 @@ idf_component_register(
     "usb_descriptors.c"
   INCLUDE_DIRS "."
   REQUIRES app_update driver esp_partition esp_timer esp_tinyusb mbedtls nvs_flash
-  PRIV_REQUIRES esp_driver_uart
+  PRIV_REQUIRES esp_driver_uart bootloader_support
 )
 
 target_compile_definitions(

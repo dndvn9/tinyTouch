@@ -1,4 +1,5 @@
 #include "usb_ccid.h"
+#include "host_pairing.h"
 
 #include <string.h>
 
@@ -52,6 +53,7 @@ static void reconnect_on_usb_task(void *argument) {
   bool expose = *(bool *)argument;
   // tud_disconnect() does not deliver an unmount callback. Cancel HID and
   // helper work before explicitly dropping this connection.
+  host_pairing_usb_reset();
   touch_pin_hid_usb_detached();
   tud_disconnect();
   vTaskDelay(pdMS_TO_TICKS(250));
@@ -102,7 +104,10 @@ static void usb_policy_task(void *argument) {
 static void usb_event_cb(tinyusb_event_t *event, void *arg) {
   (void)arg;
   if (event->id == TINYUSB_EVENT_ATTACHED) touch_pin_hid_usb_attached();
-  else if (event->id == TINYUSB_EVENT_DETACHED) touch_pin_hid_usb_detached();
+  else if (event->id == TINYUSB_EVENT_DETACHED) {
+    host_pairing_usb_reset();
+    touch_pin_hid_usb_detached();
+  }
 #ifdef CONFIG_TINYUSB_RESUME_CALLBACK
   else if (event->id == TINYUSB_EVENT_RESUMED) {
     // macOS can retain a stale composite node after wake. Reconnect with the
@@ -221,6 +226,7 @@ static void handle_message(uint8_t *msg, size_t msg_len) {
 static void ccid_init(void) {}
 static void ccid_reset(uint8_t rhport) {
   (void)rhport;
+  host_pairing_usb_reset();
   touch_pin_hid_usb_detached();
   in_busy = false;
   in_zlp_pending = false;

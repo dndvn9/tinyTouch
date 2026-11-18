@@ -222,4 +222,5 @@ int main(void) {
   return 0;
 }
 
+void host_pairing_usb_reset(void) {}
 void touch_pin_hid_usb_detached(void) {}

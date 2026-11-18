@@ -1,4 +1,5 @@
 #include "esp_err.h"
+#include "bootloader_random.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -48,6 +49,9 @@ static void recover_device(void) {
 #endif
 
 void app_main(void) {
+  // This USB-only board uses neither ADC nor radio. Keep the SAR entropy
+  // source running for hardware RNG users, including ECDH and PIV.
+  bootloader_random_enable();
   esp_err_t nvs_result = nvs_flash_init();
 #ifndef TINYTOUCH_RECOVERY_BUILD
   ESP_ERROR_CHECK(nvs_result);

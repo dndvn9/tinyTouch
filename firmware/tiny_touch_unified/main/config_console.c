@@ -1,4 +1,6 @@
 #include "config_console.h"
+#include "host_pairing.h"
+#include "mbedtls/md.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -36,6 +38,7 @@ static size_t command_length;
 static bool command_overflow;
 static char ota_token[33];
 static int64_t authorized_until;
+static unsigned authorized_epoch;
 static int64_t ota_last_activity;
 static SemaphoreHandle_t write_lock;
 static SemaphoreHandle_t rx_signal;
@@ -103,7 +106,7 @@ static bool parse_u32(const char *text, uint32_t maximum, uint32_t *value) {
   return true;
 }
 
-static bool authorized(void) { return esp_timer_get_time() < authorized_until; }
+static bool authorized(void) { return authorized_epoch == host_pairing_epoch() && esp_timer_get_time() < authorized_until; }
 
 static bool require_authorized(void) {
   if (authorized()) return true;
@@ -120,6 +123,8 @@ static void enroll_prompt(const char *state) {
 }
 
 static void authorize(void) {
+  authorized_epoch = host_pairing_epoch();
+  authorized_until = 0;
 #ifdef TINYTOUCH_DEVELOPMENT_SKIP_FINGERPRINT_AUTH
   // This symbol exists only in an explicitly opted-in local CMake build.
   authorized_until = esp_timer_get_time() + AUTH_WINDOW_US;
@@ -145,7 +150,8 @@ static void clear_ota(void) {
 }
 
 static void status(void) {
-  char line[768];
+  char line[896], identity[41];
+  piv_identity_hash(identity);
   device_options_t preferences = device_config_options();
   int count = fingerprint_count();
   // fingerprint_count probes the UART and can update the live health state.
@@ -154,14 +160,14 @@ static void status(void) {
   bool sensor_is_ready = fingerprint_is_ready();
   snprintf(line, sizeof(line),
            "OK STATUS protocol=6 firmware=%s build=%s mode=%s piv=%s sensor=%s fingerprints=%d "
-           "hosts=%u ota=%s led=%s led_only_auth=1 finger_groups=1 config_values=1 custom_config=1 "
+           "piv_id=%s pair_wrap=1 hosts=%u ota=%s led=%s led_only_auth=1 finger_groups=1 config_values=1 custom_config=1 "
            "typing_delay_ms=%u submit_enter=%u touch_cooldown_ms=%u "
            "led_idle_color=%u led_success_color=%u led_failure_color=%u led_idle_end_color=%u "
            "led_idle_effect=%u led_idle_cycles=%u led_feedback_ms=%u piv_auto_type=%u "
            "led_control=%s led_sync=%s piv_touch=%s piv_touch_active=%s piv_visible=%s piv_delay_ms=%u",
            TINYTOUCH_FIRMWARE_VERSION, TINYTOUCH_BUILD_ID, device_config_mode_name(),
            piv_uses_provisioned_keys() ? "ready" : "unconfigured",
-           sensor_is_ready ? "ready" : "offline", count,
+           sensor_is_ready ? "ready" : "offline", count, identity,
            (unsigned)device_config_hid_host_count(), firmware_update_staged() ? "staged" :
            (firmware_update_active() ? "writing" : "idle"), device_config_led_mode_name(),
            (unsigned)device_config_typing_delay_ms(), device_config_submit_enter() ? 1u : 0u,
@@ -236,6 +242,36 @@ static void led_preview(const char *arguments) {
             parse_u32(duration, 5000, &d) &&
             fingerprint_preview_led(c, e, d);
   reply(ok ? "OK LED PREVIEW" : "ERR LED preview_failed");
+}
+
+static void pair_open(const char *arguments) {
+  uint8_t peer[65], public_key[65];
+  if (!require_authorized()) return;
+  if (!decode_hex(arguments, peer, sizeof(peer)) || !host_pairing_open(peer, public_key)) {
+    reply("ERR PAIR OPEN");
+    return;
+  }
+  char line[144] = "OK PAIR OPEN ";
+  for (size_t i = 0; i < sizeof(public_key); i++)
+    snprintf(line + 13 + 2*i, 3, "%02x", public_key[i]);
+  reply(line);
+}
+
+static void pair_finish(const char *arguments) {
+  uint8_t packet[68], id[8], key[32];
+  bool ok = authorized() && decode_hex(arguments, packet, sizeof(packet)) &&
+            host_pairing_finish(packet, id, key) &&
+            fingerprint_count() > 0 && fingerprint_authorize_prompted(touch_prompt) && authorized() &&
+            device_config_add_hid_host(id, key);
+  uint8_t receipt[32];
+  const mbedtls_md_info_t *sha = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  ok = ok && sha && mbedtls_md_hmac(sha, key, sizeof(key), packet, sizeof(packet), receipt) == 0;
+  wipe(key, sizeof(key));
+  if (!ok) { reply("ERR PAIR FINISH"); return; }
+  char line[80] = "OK PAIR FINISH ";
+  for (size_t i = 0; i < sizeof(receipt); i++)
+    snprintf(line + 15 + 2*i, 3, "%02x", receipt[i]);
+  reply(line);
 }
 
 static void host_add(char *arguments) {
@@ -476,6 +512,13 @@ static void handle_command(void) {
   else if (strncmp(command, "SET MODE ", 9) == 0) set_mode(command + 9);
   else if (strncmp(command, "SET ", 4) == 0) set_value(command + 4);
   else if (strncmp(command, "LED PREVIEW ", 12) == 0) led_preview(command + 12);
+  else if (strncmp(command, "PROVE ", 6) == 0) {
+    char result[71] = "PROOF ";
+    if (touch_pin_hid_prove(command + 6, result + 6)) reply(result);
+    else reply("ERR PROVE");
+  }
+  else if (strncmp(command, "PAIR OPEN ", 10) == 0) pair_open(command + 10);
+  else if (strncmp(command, "PAIR FINISH ", 12) == 0) pair_finish(command + 12);
   else if (strncmp(command, "HOST ADD ", 9) == 0) host_add(command + 9);
   else if (strncmp(command, "HOST REMOVE ", 12) == 0) host_remove(command + 12);
   else if (strcmp(command, "HOST LIST") == 0) host_list();
@@ -523,6 +566,7 @@ static void console_task(void *arg) {
               usb_ccid_end_console_command();
             }
           } else if (command_overflow) reply("ERR LINE");
+          wipe(command, command_length);
           command_length = 0; command_overflow = false;
         } else if (command_length + 1 < sizeof(command)) command[command_length++] = buffer[i];
         else command_overflow = true;
@@ -539,6 +583,6 @@ void config_console_start(void) {
   configASSERT(write_lock);
   rx_signal = xSemaphoreCreateBinary();
   configASSERT(rx_signal);
-  BaseType_t created = xTaskCreate(console_task, "console", 6144, NULL, 3, NULL);
+  BaseType_t created = xTaskCreate(console_task, "console", 10240, NULL, 3, NULL);
   configASSERT(created == pdPASS);
 }

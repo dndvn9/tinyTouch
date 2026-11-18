@@ -335,12 +335,19 @@ def pairing_keychain_set(key_hex: str, device_id: str) -> None:
     set_password(PAIRING_SERVICE, device_id, key.hex())
 
 
+class LivePairingKey(bytearray):
+    """A Keychain credential that requires a fresh USB device proof."""
+
+
 def pairing_keychain_get(device_id: str) -> bytearray:
     value = get_password_bytes(PAIRING_SERVICE, device_id)
     if value is None:
         raise KeyError(f'No Keychain pairing key is stored for {device_id}.')
     try:
-        return bytearray(parse_pairing_key(value.decode("ascii")))
+        encoded = value.decode("ascii")
+        if encoded.startswith("live1:"):
+            return LivePairingKey(parse_pairing_key(encoded[6:]))
+        return bytearray(parse_pairing_key(encoded))
     finally:
         value[:] = b"\x00" * len(value)
 
@@ -671,6 +678,17 @@ def require_startup_status(
     raise serial.SerialException(f'tinyTouch did not respond to STATUS on {port}.')
 
 
+def secure_keyboard_entry() -> bool:
+    """Require macOS secure keyboard entry before releasing a live HID credential."""
+    try:
+        toolbox = _keyboard_layout_libraries()[0]
+        enabled = toolbox.IsSecureEventInputEnabled
+        enabled.restype = ctypes.c_bool
+        return bool(enabled())
+    except (AttributeError, OSError):
+        return False
+
+
 def serve_port(
     port: str,
     once: bool = False,
@@ -681,6 +699,9 @@ def serve_port(
     password: dict[int, bytearray] = {}
     pairing_key = bytearray()
     last_port_check = 0.0
+    proof_expected = ""
+    proof_deadline = 0.0
+    pending_event = ""
     heartbeat_sent_at: float | None = None
     decoder = SerialFrameDecoder(MAX_SERIAL_LINE_BYTES)
     try:
@@ -745,6 +766,28 @@ def serve_port(
                             heartbeat_sent_at = None
                             last_heartbeat = now
                         continue
+                    if isinstance(pairing_key, LivePairingKey):
+                        if line.startswith("PROOF "):
+                            if (not proof_expected or now >= proof_deadline
+                                    or not hmac.compare_digest(line[6:], proof_expected)):
+                                continue
+                            line, pending_event, proof_expected = pending_event, "", ""
+                            if not secure_keyboard_entry():
+                                diagnostic("protocol.event_rejected", level="warning", reason="secure_input_required")
+                                continue
+                        elif line.startswith(("EV ", "EV2 ")):
+                            event = parse_event(line, pairing_key)
+                            if event is None or event.nonce.lower() in state["seen_nonces"]:
+                                continue
+                            host = hashlib.sha256(pairing_key).hexdigest()[:16]
+                            challenge = f"{host} {event.nonce} {os.urandom(16).hex()}"
+                            proof_expected = mac_hex(pairing_key, "PROVE|" + challenge)
+                            proof_deadline = now + 3.0
+                            pending_event = line
+                            ser.write(f"PROVE {challenge}\n".encode("ascii"))
+                            continue
+                        else:
+                            continue
                     line = resynchronize_event(line, device_id)
                     version = re.match(r"(EV[0-9]+) ", line)
                     if version is not None and version[1] != "EV2":
@@ -764,8 +807,8 @@ def serve_port(
                                          device_id=device_id, keyboard_map=keyboard_map,
                                          record_nonce=False)
                     if reply:
-                        ser.write(reply.encode("ascii"))
                         remember_nonce(state, line.split()[1], device_id)
+                        ser.write(reply.encode("ascii"))
                         diagnostic(
                             "protocol.password_delivered",
                             device_id=device_id,
