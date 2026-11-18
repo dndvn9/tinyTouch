@@ -5,6 +5,7 @@ from contextlib import nullcontext
 import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
@@ -35,6 +36,17 @@ class ProtocolSixTests(unittest.TestCase):
             ("_active_serial", None),
         ):
             self.enterContext(mock.patch.object(cli, name, value))
+
+    def test_manager_disconnect_returns_a_cli_error(self):
+        with (
+            mock.patch.dict(cli.os.environ, {"TINYTOUCH_GUI": "1", "TINYTOUCH_GUI_DEVICE": "TT-001122334455"}),
+            mock.patch.object(cli.sys, "argv", ["tinytouch", "--port", "/dev/cu.test", "status"]),
+            mock.patch.object(cli.sys, "stderr", new_callable=io.StringIO) as errors,
+            mock.patch.object(cli, "show_startup_mark"),
+            mock.patch("tinytouch_helper.device_endpoints", return_value=[]),
+        ):
+            self.assertEqual(cli.main(), 1)
+            self.assertIn("Selected tinyTouch disconnected", errors.getvalue())
 
     def test_chime_is_nonblocking_and_does_not_overlap(self):
         process = mock.Mock()

@@ -3355,16 +3355,16 @@ def main() -> int:
         helper_main()
         return 0
     args = parser().parse_args()
-    expected = os.environ.get("TINYTOUCH_GUI_DEVICE")
-    if expected and os.environ.get("TINYTOUCH_GUI") == "1":
-        from tinytouch_helper import device_endpoints
-        if not any(item.port == args.port and item.device_id == expected
-                   for item in device_endpoints()):
-            raise ToolError("Selected tinyTouch disconnected. Reconnect it and try again.")
     VERBOSE = args.verbose
     if args.command != "help" and (args.command or (sys.stdin.isatty() and sys.stdout.isatty())):
         show_startup_mark(args.command or "menu")
     try:
+        expected = os.environ.get("TINYTOUCH_GUI_DEVICE")
+        if expected and os.environ.get("TINYTOUCH_GUI") == "1":
+            from tinytouch_helper import device_endpoints
+            if not any(item.port == args.port and item.device_id == expected
+                       for item in device_endpoints()):
+                raise ToolError("Selected tinyTouch disconnected. Reconnect it and try again.")
         args.func(args)
     except KeyboardInterrupt:
         say("Cancelled.")
