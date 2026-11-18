@@ -25,7 +25,7 @@ const RELEASE_API = 'https://api.github.com/repos/ZimengXiong/tinyTouch/releases
 const selected = ref<ToolName>('factory')
 const manifest = ref<Manifest | null>(null)
 const firmwareFiles = ref<FirmwareFile[]>([])
-const serialSupported = ref(false)
+const serialSupported = ref<boolean | null>(null)
 const busy = ref(false)
 const progress = ref(0)
 const stage = ref('Ready')
@@ -229,7 +229,6 @@ onMounted(async () => {
     selected.value = 'recovery'
   }
   serialSupported.value = 'serial' in navigator
-  if (!serialSupported.value) show('Open this page in Google Chrome or Microsoft Edge.', 'error')
   await selectTool()
 })
 </script>
@@ -256,6 +255,9 @@ onMounted(async () => {
       <button type="button" :disabled="!serialSupported || busy || !manifest || firmwareFiles.length !== manifest.images.length" @click="flash">
         {{ selected === 'recovery' ? 'Erase and recover' : 'Connect and flash' }}
       </button>
+      <div v-if="serialSupported === false" class="flash-status error" role="status">
+        Open this page in Google Chrome or Microsoft Edge.
+      </div>
       <div v-if="status" class="flash-status" :class="statusKind" role="status">{{ status }}</div>
       <pre ref="logRef" hidden>{{ log }}</pre>
     </div>
