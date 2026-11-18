@@ -222,6 +222,8 @@ class ReleasePipelineTests(unittest.TestCase):
             release.mkdir()
             self.make_release(release)
             output = root / "publish"
+            output.mkdir()
+            (output / "old").touch()
             subprocess.run(
                 [
                     "python3", str(ROOT / "release" / "finalize-release.py"),
@@ -240,6 +242,40 @@ class ReleasePipelineTests(unittest.TestCase):
             (output / "unexpected.bin").write_bytes(b"unexpected")
             with self.assertRaisesRegex(integrity.IntegrityError, "published asset set mismatch"):
                 integrity.validate_release(output, self.commit, flat=True)
+
+    def test_bad_inputs_keep_previous_output_for_both_release_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "publish"
+            output.mkdir()
+            previous = output / "previous.bin"
+            previous.write_bytes(b"keep this release")
+            for script, arguments in (
+                ("assemble-release.py", ["--firmware-build", "factory", "--recovery-build", "recovery"]),
+                ("finalize-release.py", ["release", "--commit", self.commit]),
+            ):
+                with self.subTest(script=script):
+                    result = subprocess.run(
+                        ["python3", str(ROOT / "release" / script), *arguments, "--output", str(output)],
+                        cwd=root, capture_output=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(previous.read_bytes(), b"keep this release")
+
+    def test_publish_rollback_restores_old_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "publish"
+            output.mkdir()
+            marker = output / "old"
+            marker.touch()
+            with self.assertRaises(FileNotFoundError):
+                with integrity.staged_output(output) as staged:
+                    staged.rmdir()
+            self.assertTrue(marker.exists())
+            with self.assertRaisesRegex(integrity.IntegrityError, "overlaps input"):
+                with integrity.staged_output(output, marker):
+                    self.fail("overlapping input reached staging")
 
     def test_descriptor_version_mismatch_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:

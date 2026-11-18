@@ -4,11 +4,16 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
+import os
 import re
+import shutil
 import struct
 import tarfile
+import tempfile
 from pathlib import Path, PurePosixPath
 
 
@@ -55,6 +60,46 @@ def digest(path: Path) -> str:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise IntegrityError(message)
+
+
+@contextmanager
+def staged_output(destination: Path, *sources: Path):
+    """Keep the previous release available if assembly or validation fails."""
+    require(not destination.is_symlink(), f"output is a symlink: {destination}")
+    output = destination.resolve()
+    require(output != ROOT and output not in ROOT.parents, f"unsafe output: {output}")
+    for source in sources:
+        source = source.resolve()
+        require(source != output and output not in source.parents and source not in output.parents,
+                f"output overlaps input: {output} and {source}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(dir=output.parent, prefix=".tinytouch-release-"))
+    staged, previous = work / "new", work / "previous"
+    try:
+        staged.mkdir()
+        yield staged
+        # Serialize the two renames for publishers targeting the same directory.
+        parent_fd = os.open(output.parent, os.O_RDONLY)
+        try:
+            fcntl.flock(parent_fd, fcntl.LOCK_EX)
+            require(not output.is_symlink() and (not output.exists() or output.is_dir()),
+                    f"expected an output directory: {output}")
+            if output.exists():
+                output.rename(previous)
+            try:
+                staged.rename(output)
+            except BaseException:
+                if previous.exists():
+                    previous.rename(output)
+                raise
+        finally:
+            os.close(parent_fd)
+        if previous.exists():
+            shutil.rmtree(previous)
+    finally:
+        # Preserve the backup if the filesystem also refused rollback.
+        if not previous.exists():
+            shutil.rmtree(work)
 
 
 def checked_version(value: object) -> str:

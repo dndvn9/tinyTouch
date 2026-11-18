@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from release_integrity import checked_version
+from release_integrity import checked_version, staged_output, validate_cli_archive, validate_layout
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -81,11 +81,14 @@ def main() -> None:
     args = parser.parse_args()
 
     checked_version(VERSION)
-    output = args.output.resolve()
-    if output.exists():
-        shutil.rmtree(output)
-    output.mkdir(parents=True)
+    sources = [args.firmware_build, args.recovery_build]
+    if args.cli:
+        sources.append(args.cli)
+    with staged_output(args.output, *sources) as output:
+        assemble(args, output)
 
+
+def assemble(args: argparse.Namespace, output: Path) -> None:
     layouts = {}
     specifications = {
         "factory": (
@@ -158,6 +161,8 @@ def main() -> None:
         ).stdout.strip()
     if len(build_id) != 12 or any(character not in "0123456789abcdef" for character in build_id):
         raise SystemExit("build ID must be the first 12 lowercase hex characters of the commit SHA")
+    for kind, layout in layouts.items():
+        validate_layout(output, kind, layout, VERSION, PROTOCOL, build_id, flat=False)
     release = {
         "version": VERSION,
         "build": build_id,
@@ -174,6 +179,7 @@ def main() -> None:
     if args.cli:
         cli_target = output / "tinytouch-macos-arm64.tar.gz"
         shutil.copy2(args.cli, cli_target)
+        validate_cli_archive(cli_target)
         release["cli"] = {
             "macos-arm64": {
                 "file": cli_target.name,

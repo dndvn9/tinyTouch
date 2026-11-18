@@ -8,7 +8,7 @@ import shutil
 import tarfile
 from pathlib import Path
 
-from release_integrity import digest, validate_checksums, validate_release
+from release_integrity import digest, staged_output, validate_checksums, validate_release
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,11 +29,12 @@ def main() -> None:
     parser.add_argument("--commit", required=True)
     args = parser.parse_args()
     release = args.release.resolve()
-    output = args.output.resolve()
-    if output.exists():
-        shutil.rmtree(output)
-    output.mkdir(parents=True)
     manifest = validate_release(release, args.commit)
+    with staged_output(args.output, release) as output:
+        finalize(release, output, manifest, args.commit)
+
+
+def finalize(release: Path, output: Path, manifest: dict, commit: str) -> None:
     copy_once(release / "release-manifest.json", output / "release-manifest.json")
     for kind in ("factory", "recovery"):
         layout = manifest["firmware"][kind]
@@ -53,7 +54,7 @@ def main() -> None:
         if path.is_file() and path.name != "checksums.txt"
     ]
     (output / "checksums.txt").write_text("\n".join(lines) + "\n", encoding="ascii")
-    validate_release(output, args.commit, flat=True)
+    validate_release(output, commit, flat=True)
     validate_checksums(output)
 
 
