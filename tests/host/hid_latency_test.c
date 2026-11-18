@@ -109,6 +109,10 @@ static bool tud_hid_keyboard_report(uint8_t id, uint8_t modifier, const uint8_t 
 }
 
 /* implementation */
+
+static bool type_ascii(const uint8_t *data, size_t length) {
+  return type_ascii_in_session(data, length, hid_session_id());
+}
 /* callbacks */
 
 static void reset(void) {

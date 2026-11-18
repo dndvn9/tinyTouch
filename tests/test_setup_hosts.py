@@ -230,7 +230,26 @@ class SetupFlowTests(unittest.TestCase):
         self.assertEqual(pair.call_args.args[0].port, "/dev/cu.TT-NEW")
         self.assertIsNone(self.args.port)
         self.configure.assert_not_called()
-        self.install.assert_not_called()
+        # PIV keeps the helper so the device types its PIN only into password fields.
+        self.install.assert_called_once_with()
+
+    def test_completed_piv_setup_still_installs_screen_reports(self):
+        self.args.mode = "piv"
+        self.status.return_value = {**DEVICE, "mode": "piv", "piv": "ready", "piv_id": "AB"}
+        with mock.patch.object(cli, "user_piv_identities", return_value={"AB"}):
+            cli.command_setup(self.args)
+        self.assertIn("already complete", self.output.getvalue())
+        self.install.assert_called_once_with()
+        self.assertEqual(self.session.call_count, 1)
+
+    def test_piv_setup_warns_when_screen_reports_are_unavailable(self):
+        self.args.mode = "piv"
+        self.status.return_value = {**DEVICE, "mode": "piv", "piv": "ready", "piv_id": "AB"}
+        self.install.side_effect = cli.ToolError("The replacement HID helper failed.")
+        self.loaded.return_value = False
+        with mock.patch.object(cli, "user_piv_identities", return_value={"AB"}):
+            cli.command_setup(self.args)
+        self.assertIn("may type its PIN into an open app", self.output.getvalue())
 
 
 class ModeFlowTests(unittest.TestCase):
@@ -297,12 +316,12 @@ class ModeFlowTests(unittest.TestCase):
             cli.command_mode(self.args)
         self.assertNotIn("HID mode is active", self.output.getvalue())
 
-    def test_piv_mode_removes_helper_without_hid_pairing_changes(self):
+    def test_piv_mode_keeps_helper_for_screen_reports_without_hid_pairing_changes(self):
         self.args.mode = "piv"
         self.fresh.return_value = {**DEVICE, "mode": "piv"}
         cli.command_mode(self.args)
-        self.remove.assert_called_once()
-        self.install.assert_not_called()
+        self.remove.assert_not_called()
+        self.install.assert_called_once_with()
         self.verify.assert_not_called()
         self.command.assert_called_once_with(PORT, "SET MODE PIV", timeout=4)
 

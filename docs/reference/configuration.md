@@ -114,13 +114,19 @@ Firmware 0.1.34 includes `tinytouch piv-touch on`. After authorizing the change,
 unplug and reconnect tinyTouch. PIV mode then hides its smart-card interface
 while idle, so macOS can offer password entry at the login or lock screen.
 
-With firmware 0.1.37, a matching fingerprint starts the wake sequence. When
-the card is hidden, tinyTouch requests USB remote wake if the bus is suspended,
-sends and releases the left Shift modifier, then waits one second before
-exposing the card for up to 20 seconds. A host that declines remote wake needs
-to be woken separately. The device log records a completed wake report as
-`piv_wake_sent`. The Mac controls when the PIN field is ready and visible.
-After card discovery, tinyTouch grants the matching touch for PIV operations.
+With firmware 0.1.38, a matching fingerprint requests USB remote wake if
+the bus is suspended and waits up to 20 seconds for it to resume. The request
+repeats every 2 seconds while the bus stays suspended. If the Mac resets or
+reconnects USB as it wakes, tinyTouch continues on the new connection, so the
+same touch still unlocks. tinyTouch
+presses and releases left Shift even if the card is already visible, since
+the display can sleep independently of USB. One second later it exposes the
+card. macOS can discover it at any point during the 20-second touch window.
+Any reconnect requested by USB resume takes place at that point so macOS
+can select the card and unlock with the same touch. A host that declines remote
+wake needs to be woken separately. The device log records a completed wake
+report as `piv_wake_sent`. The Mac controls when the PIN field is ready and visible.
+When the touch is ready to complete, tinyTouch grants presence for PIV operations.
 The card hides again after login and Login Keychain responses complete or the
 visibility window expires.
 
@@ -129,6 +135,29 @@ authentication. Run `tinytouch piv-touch off`, then unplug and reconnect, to
 restore continuous PIV visibility. Factory reset restores the default. Upgrading
 preserves the existing configuration and pairings.
 
+### PIN entry only into password fields
+
+PIV setup keeps the background service running. It reports the active console's
+lock screen or, on the desktop, a focused secure text field with Secure Event
+Input enabled. To use desktop password fields, grant the running tinyTouch
+helper access in **System Settings → Privacy & Security → Accessibility**.
+The helper never requests access automatically. Without access it blocks
+desktop entry. The lock-screen check runs independently of Accessibility.
+The service repeats its report every 2 seconds.
+
+When the Mac is unlocked and no password field has focus, a matching
+fingerprint only wakes the display. tinyTouch does not show the card or type,
+and logs `piv_touch_unlocked`. If the state changes during a touch, such as
+when a sleeping Mac wakes unlocked, the service reports again after the card
+appears. tinyTouch then hides the card without typing and logs `piv_entry_blocked`.
+
+A Mac without the service, such as at the login window after startup, gets PIN
+entry as before. Terminal's **Secure Keyboard Entry** setting alone does not
+authorize typing at a shell prompt. A background user session also blocks
+entry. Live HID pairings check the active target again after device proof.
+Legacy HID pairings retain their original behavior. `tinytouch logs` records each reported state change as `host_screen` (1 unlocked,
+2 password expected).
+
 `tinytouch pair` can temporarily expose the card for setup after fingerprint
 authorization. This discovery window lasts 60 seconds; it does not grant
 private-key access by itself. A Mac policy requiring smart cards still applies.
@@ -136,7 +165,11 @@ private-key access by itself. A Mac policy requiring smart cards still applies.
 ### Delay before PIN entry
 
 After macOS selects the PIV applet and USB/HID are ready, tinyTouch waits
-50 ms before typing its dummy PIN. Set a different delay with:
+at least 50 ms by default before typing its dummy PIN. On a slow Mac with
+PIV touch activation and automatic PIN entry enabled, keep your enrolled
+finger on the sensor until the PIN field appears, then lift to type. A quick
+tap uses the configured delay. If the card window expires first, lift and
+touch again. Set a different delay with:
 
 ```sh
 tinytouch config piv_delay_ms 25
@@ -145,8 +178,8 @@ tinytouch config piv_delay_ms 25
 The range is 0–5000 ms. Fingerprint approval is required. The setting persists
 across reconnects and applies to the next touch login without a reboot.
 `tinytouch status` reports the saved value as `piv_delay_ms`.
-The scheduler uses 10 ms ticks, so PIN entry can start up to one tick after the
-configured delay. Existing saved delays are retained when firmware is updated.
+The scheduler checks the delay in 10 ms ticks. Existing saved delays are
+retained when firmware is updated.
 
 The device cannot confirm when macOS finishes switching the login field. Test
 50 ms on your Mac, including after wake and reconnect. If PIN entry starts too

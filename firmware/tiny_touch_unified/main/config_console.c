@@ -509,6 +509,8 @@ static void handle_command(void) {
   else if (strcmp(command, "LOGS") == 0) touch_pin_hid_send_logs();
   else if (strcmp(command, "USB RECONNECT") == 0) usb_reconnect();
   else if (strcmp(command, "AUTH") == 0) authorize();
+  else if (strncmp(command, "SCREEN ", 7) == 0)
+    reply(touch_pin_hid_set_host_screen(command + 7) ? "OK SCREEN" : "ERR SCREEN");
   else if (strncmp(command, "SET MODE ", 9) == 0) set_mode(command + 9);
   else if (strncmp(command, "SET ", 4) == 0) set_value(command + 4);
   else if (strncmp(command, "LED PREVIEW ", 12) == 0) led_preview(command + 12);

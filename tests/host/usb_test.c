@@ -11,14 +11,21 @@ static bool deferred;
 static bool ota_active;
 static bool complete_login;
 static bool transfer_queued = true;
-static uint16_t delay_ms = 50;
+static int64_t select_at_us;
+static uint8_t select_piv[] = {0x6f, 4,0,0,0, 0,1,0,0,0, 0,0xa4,4,0};
 static uint8_t *out_buffer;
 static uint16_t out_capacity, in_length;
 static int out_requests, in_requests;
 static size_t response_size = 2;
 
 int64_t esp_timer_get_time(void) { return now_us; }
-void vTaskDelay(uint32_t ticks) { now_us += (int64_t)ticks * 10000; }
+void vTaskDelay(uint32_t ticks) {
+  now_us += (int64_t)ticks * 10000;
+  if (select_at_us && now_us >= select_at_us) {
+    select_at_us = 0;
+    handle_message(select_piv, sizeof(select_piv));
+  }
+}
 int xTaskCreate(void (*fn)(void *), const char *n, int s, void *a, int p, void *t) {
   (void)fn; (void)n; (void)s; (void)a; (void)p; (void)t; return pdPASS;
 }
@@ -55,7 +62,6 @@ int tinyusb_driver_install(const tinyusb_config_t *c) {
 int esp_read_mac(uint8_t *m, int kind) { (void)kind; memset(m, 42, 6); return 0; }
 device_mode_t device_config_mode(void) { return mode; }
 bool device_config_piv_touch_enabled(void) { return preference; }
-uint16_t device_config_piv_delay_ms(void) { return delay_ms; }
 bool firmware_update_active(void) { return ota_active; }
 void piv_reset_transport_state(void) { resets++; }
 void touch_pin_hid_log_event(const char *event, int value) { (void)event; (void)value; }
@@ -103,27 +109,17 @@ int main(void) {
   usb_ccid_touch_begin(); update_usb_policy(); check_descriptor(true);
   assert(usb_ccid_piv_visible() && resets > 0);
   assert(!usb_ccid_wait_for_piv()); // No enumeration: never type a PIN.
+  assert(now_us == touch_until);
   usb_ccid_touch_cancel(); update_usb_policy(); check_descriptor(false);
 
   // A discovered token becomes ready only after a successful PIV SELECT.
   usb_ccid_touch_begin(); update_usb_policy();
   configured = hid_ready = true;
-  uint8_t select[] = {0x6f, 4,0,0,0, 0,1,0,0,0, 0,0xa4,4,0};
-  in_busy = false; handle_message(select, sizeof(select));
+  in_busy = false;
+  int64_t selected_at = now_us + 12000000;
+  select_at_us = selected_at;
+  assert(usb_ccid_wait_for_piv() && now_us == selected_at);
   assert(apdus == 1 && piv_selected);
-  int64_t started = now_us;
-  assert(usb_ccid_wait_for_piv());
-  assert(now_us - started == 50000);
-  delay_ms = 25;
-  started = now_us;
-  assert(usb_ccid_wait_for_piv() && now_us - started >= 25000 && now_us - started < 35000);
-  delay_ms = 100;
-  started = now_us;
-  assert(usb_ccid_wait_for_piv() && now_us - started == 100000);
-  delay_ms = 0;
-  started = now_us;
-  assert(usb_ccid_wait_for_piv() && now_us == started);
-  delay_ms = 50;
   // Host traffic and a held finger cannot prolong the touch lease.
   now_us = touch_until;
   usb_ccid_begin_console_command();
@@ -176,7 +172,7 @@ int main(void) {
   update_usb_policy(); check_descriptor(true);
   assert(!login_response_pending);
   complete_login = false;
-  handle_message(select, sizeof(select));
+  handle_message(select_piv, sizeof(select_piv));
   ccid_xfer_cb(0, CCID_EP_IN, XFER_RESULT_SUCCESS, 12);
   update_usb_policy(); check_descriptor(true); // Unrelated reply cannot hide.
   now_us = touch_until; update_usb_policy(); check_descriptor(false);
@@ -205,12 +201,48 @@ int main(void) {
   old = reconnects; usb_event_cb(&resumed, NULL); update_usb_policy();
   assert(reconnects == old + 1); check_descriptor(false);
 
+  // One verified touch wakes the host, then changes descriptors only for insertion.
+  old = reconnects;
+  usb_ccid_defer_reconnect_for_touch();
+  usb_event_cb(&resumed, NULL); update_usb_policy();
+  assert(reconnects == old && !usb_ccid_piv_visible());
+  usb_ccid_touch_begin(); update_usb_policy();
+  assert(reconnects == old + 1 && usb_ccid_piv_visible());
+
+  // A visible card must be selected again after waking before PIN entry is ready.
+  configured = hid_ready = true;
+  in_busy = false; handle_message(select_piv, sizeof(select_piv));
+  assert(usb_ccid_wait_for_piv());
+  usb_ccid_defer_reconnect_for_touch();
+  usb_event_cb(&resumed, NULL); update_usb_policy();
+  usb_ccid_touch_begin();
+  assert(!usb_ccid_touch_ready());
+  update_usb_policy();
+  assert(reconnects == old + 2 && !piv_selected);
+  configured = hid_ready = true;
+  in_busy = false; handle_message(select_piv, sizeof(select_piv));
+  assert(usb_ccid_wait_for_piv());
+  usb_ccid_touch_cancel(); update_usb_policy();
+
+  // Cancellation releases a deferred reconnect.
+  usb_ccid_defer_reconnect_for_touch();
+  usb_ccid_touch_cancel();
+  old = reconnects; usb_event_cb(&resumed, NULL); update_usb_policy();
+  assert(reconnects == old + 1);
+  // A bus reset while the Mac wakes keeps the deferral until the touch ends.
+  usb_ccid_defer_reconnect_for_touch();
+  ccid_reset(0);
+  old = reconnects; usb_event_cb(&resumed, NULL); update_usb_policy();
+  assert(reconnects == old);
+  usb_ccid_touch_cancel(); update_usb_policy();
+  assert(reconnects == old + 1);
+
   // HID mode never exposes PIV due to touch/setup when the option is active.
   mode = DEVICE_MODE_HID; usb_ccid_touch_begin(); usb_ccid_rescan();
   update_usb_policy(); check_descriptor(false);
   assert(!usb_ccid_wait_for_piv());
   old = apdus;
-  in_busy = false; handle_message(select, sizeof(select)); assert(apdus == old);
+  in_busy = false; handle_message(select_piv, sizeof(select_piv)); assert(apdus == old);
 
   // Continuous PIV mode keeps its interface after a completed login.
   preference = false; mode = DEVICE_MODE_PIV;

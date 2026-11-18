@@ -1760,6 +1760,7 @@ def command_setup(args: argparse.Namespace) -> None:
     expected_account: str | None = None
     reconnected = False
     hid_configured = False
+    piv_already_complete = False
     while True:
         mode_changed = False
         with foreground_session(port) as connected_port:
@@ -1780,7 +1781,8 @@ def command_setup(args: argparse.Namespace) -> None:
             ):
                 say("PIV setup is already complete on this Mac.")
                 explain_piv_pin()
-                return
+                piv_already_complete = True
+                break
             if mode == "hid" and not hid_configured:
                 expected_account = device_account(port)
                 if device.get("pair_wrap") == "1" and device.get("fingerprints") == "0":
@@ -1812,7 +1814,7 @@ def command_setup(args: argparse.Namespace) -> None:
                 device = status(port)
                 protocol6(device)
                 sensor_ready(device)
-        if not mode_changed:
+        if piv_already_complete or not mode_changed:
             break
         notify(
             "tinyTouch mode changed",
@@ -1827,6 +1829,10 @@ def command_setup(args: argparse.Namespace) -> None:
                 f"Unplug and reconnect tinyTouch, then run 'tinytouch setup --mode {mode}' again."
             ) from exc
         reconnected = True
+    if piv_already_complete:
+        # The foreground session has released the serial port.
+        install_piv_screen_helper()
+        return
     if piv_rescan_needed:
         say("")
         created_piv_identities = wait_for_piv_identities(
@@ -1859,6 +1865,8 @@ def command_setup(args: argparse.Namespace) -> None:
             identities=created_piv_identities,
             separate_identity_list=created_piv_identities is not None,
         )
+    if mode == "piv":
+        install_piv_screen_helper()
     say("")
     say(f"Ready ({mode.upper()}).")
 
@@ -1878,8 +1886,6 @@ def command_mode(args: argparse.Namespace) -> None:
                 say(f"HID password typing needs setup on this Mac. {exc}")
         unlock(port, reason=f"switch to {args.mode.upper()} mode")
         serial_command(port, f"SET MODE {args.mode.upper()}", timeout=4)
-        if args.mode == "piv":
-            remove_helper()
     notify("tinyTouch mode changed", "Reconnect tinyTouch to apply the new device mode.")
     say(f"{args.mode.upper()} mode was selected.")
     say("")
@@ -1905,6 +1911,8 @@ def command_mode(args: argparse.Namespace) -> None:
         install_helper()
         if not helper_loaded():
             raise ToolError("HID mode was selected, but the helper is not loaded. Run 'tinytouch setup --mode hid'.")
+    else:
+        install_piv_screen_helper()
     say(f"{args.mode.upper()} mode is active.")
 
 
@@ -2562,6 +2570,25 @@ def user_piv_identities() -> list[str]:
             r"(?m)^Hash:[ \t]+([0-9A-Fa-f]{40})\b", result.stdout
         )
     ]
+
+
+def install_piv_screen_helper() -> None:
+    """Run the helper in PIV mode so the device types its PIN only into password fields.
+
+    PIV login still works without it, so a failure is reported but not fatal.
+    """
+    try:
+        install_helper()
+        loaded = helper_loaded()
+    except ToolError as exc:
+        say(f"Warning: {exc}")
+        loaded = False
+    if not loaded:
+        say(
+            "Warning: the background service is not running. tinyTouch cannot tell "
+            "whether a password field is focused and may type its PIN into an open app. "
+            "Run 'tinytouch setup --mode piv' again to retry."
+        )
 
 
 def explain_piv_pin() -> None:

@@ -56,6 +56,10 @@ STARTUP_STATUS_TIMEOUT_SECONDS = 30.0
 KEYCHAIN_RETRY_SECONDS = 0.5
 MAX_WORKER_RETRY_SECONDS = 2.0
 MAX_SERIAL_LINE_BYTES = 2048
+SCREEN_POLL_SECONDS = 0.2
+SCREEN_REPORT_INTERVAL_SECONDS = 2.0
+SCREEN_ONLY_CREDENTIAL_CHECK_SECONDS = 2.0
+_CF_STRING_ENCODING_UTF8 = 0x08000100
 PARTIAL_FRAME_TIMEOUT_SECONDS = 1.0
 MAX_PASSWORD_BYTES = 160
 MAX_EVENT_AUTHENTICATORS = 8
@@ -689,12 +693,149 @@ def secure_keyboard_entry() -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
+def _session_libraries():
+    core_graphics = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+    )
+    core_foundation = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    core_graphics.CGSessionCopyCurrentDictionary.restype = ctypes.c_void_p
+    core_foundation.CFStringCreateWithCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+    ]
+    core_foundation.CFStringCreateWithCString.restype = ctypes.c_void_p
+    core_foundation.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    core_foundation.CFDictionaryGetValue.restype = ctypes.c_void_p
+    core_foundation.CFGetTypeID.argtypes = [ctypes.c_void_p]
+    core_foundation.CFGetTypeID.restype = ctypes.c_ulong
+    core_foundation.CFBooleanGetTypeID.restype = ctypes.c_ulong
+    core_foundation.CFBooleanGetValue.argtypes = [ctypes.c_void_p]
+    core_foundation.CFBooleanGetValue.restype = ctypes.c_bool
+    core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+    core_foundation.CFRelease.restype = None
+    return core_graphics, core_foundation
+
+
+@lru_cache(maxsize=1)
+def _accessibility_libraries():
+    ax = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+    _, cf = _session_libraries()
+    ax.AXIsProcessTrusted.restype = ctypes.c_bool
+    ax.AXUIElementCreateSystemWide.restype = ctypes.c_void_p
+    ax.AXUIElementSetMessagingTimeout.argtypes = [ctypes.c_void_p, ctypes.c_float]
+    ax.AXUIElementCopyAttributeValue.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+    ]
+    cf.CFEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    cf.CFEqual.restype = ctypes.c_bool
+    return ax, cf
+
+
+def secure_field_focused() -> bool:
+    try:
+        ax, cf = _accessibility_libraries()
+    except (AttributeError, OSError):
+        return False
+    if not ax.AXIsProcessTrusted():
+        return False
+    system = ax.AXUIElementCreateSystemWide()
+    if not system:
+        return False
+    refs = [system]
+    try:
+        # Bound AX calls so an unresponsive app cannot stall serial heartbeats.
+        if ax.AXUIElementSetMessagingTimeout(system, 0.15):
+            return False
+        element = system
+        for name in (b"AXFocusedUIElement", b"AXSubrole"):
+            key = cf.CFStringCreateWithCString(None, name, _CF_STRING_ENCODING_UTF8)
+            if not key:
+                return False
+            refs.append(key)
+            result = ctypes.c_void_p()
+            if ax.AXUIElementCopyAttributeValue(element, key, ctypes.byref(result)) or not result.value:
+                return False
+            element = result.value
+            refs.append(element)
+        secure = cf.CFStringCreateWithCString(None, b"AXSecureTextField", _CF_STRING_ENCODING_UTF8)
+        if not secure:
+            return False
+        refs.append(secure)
+        return bool(cf.CFEqual(element, secure))
+    finally:
+        for ref in reversed(refs):
+            cf.CFRelease(ref)
+
+
+def _session_flag(core_foundation, session: int, name: bytes) -> bool | None:
+    key = core_foundation.CFStringCreateWithCString(None, name, _CF_STRING_ENCODING_UTF8)
+    if not key:
+        return None
+    try:
+        value = core_foundation.CFDictionaryGetValue(session, key)
+        if value and core_foundation.CFGetTypeID(value) == core_foundation.CFBooleanGetTypeID():
+            return bool(core_foundation.CFBooleanGetValue(value))
+        return None
+    finally:
+        core_foundation.CFRelease(key)
+
+
+def screen_state() -> str:
+    """Report a typing target only for this Mac's active console session."""
+    try:
+        core_graphics, core_foundation = _session_libraries()
+    except (AttributeError, OSError):
+        return "UNLOCKED"
+    session = core_graphics.CGSessionCopyCurrentDictionary()
+    if not session:
+        return "UNLOCKED"
+    try:
+        locked = _session_flag(core_foundation, session, b"CGSSessionScreenIsLocked")
+        on_console = _session_flag(core_foundation, session, b"kCGSSessionOnConsoleKey")
+    finally:
+        core_foundation.CFRelease(session)
+    if on_console is not True:
+        return "UNLOCKED"
+    if locked:
+        return "LOCKED"
+    return "SECURE" if secure_keyboard_entry() and secure_field_focused() else "UNLOCKED"
+
+
+class ScreenReporter:
+    """Send the screen state on change, and periodically so firmware knows the helper is alive."""
+
+    def __init__(self) -> None:
+        self.checked_at: float | None = None
+        self.sent: str | None = None
+        self.sent_at = 0.0
+
+    def poll(self, ser: serial.Serial, now: float) -> None:
+        if self.checked_at is not None and now - self.checked_at < SCREEN_POLL_SECONDS:
+            return
+        self.checked_at = now
+        current = screen_state()
+        if current is None:
+            return
+        if current != self.sent or now - self.sent_at >= SCREEN_REPORT_INTERVAL_SECONDS:
+            ser.write(f"SCREEN {current}\n".encode("ascii"))
+            self.sent, self.sent_at = current, now
+
+
 def serve_port(
     port: str,
     once: bool = False,
     stop_event: threading.Event | None = None,
     device_id: str | None = None,
+    screen_only: bool = False,
 ) -> None:
+    """Serve HID password requests and report the screen state for PIV entry.
+
+    A device without HID credentials on this Mac, such as one in PIV mode,
+    gets screen reports only. The worker returns once credentials appear so the
+    manager restarts it with password support.
+    """
     device_id = normalize_serial(device_id or "") or port_identity(port)
     password: dict[int, bytearray] = {}
     pairing_key = bytearray()
@@ -704,11 +845,14 @@ def serve_port(
     pending_event = ""
     heartbeat_sent_at: float | None = None
     decoder = SerialFrameDecoder(MAX_SERIAL_LINE_BYTES)
+    screen = ScreenReporter()
+    credentials_checked_at = time.monotonic()
     try:
-        password = load_passwords(device_id)
-        pairing_key = pairing_keychain_get(device_id)
-        state = load_state(device_id)
-        settings = load_settings(device_id)
+        if not screen_only:
+            password = load_passwords(device_id)
+            pairing_key = pairing_keychain_get(device_id)
+            state = load_state(device_id)
+            settings = load_settings(device_id)
         with open_serial(port) as ser:
             pending_frames = require_startup_status(
                 ser, device_id, port, decoder=decoder, stop_event=stop_event
@@ -729,8 +873,17 @@ def serve_port(
                 if stop_event is not None and stop_event.is_set():
                     diagnostic("worker.drained", device_id=device_id, port=port)
                     return
+                screen.poll(ser, time.monotonic())
                 chunk = b"" if pending_frames else read_available(ser)
                 now = time.monotonic()
+                if screen_only and now - credentials_checked_at >= SCREEN_ONLY_CREDENTIAL_CHECK_SECONDS:
+                    credentials_checked_at = now
+                    try:
+                        if credentials_exist(device_id):
+                            diagnostic("worker.credentials_available", device_id=device_id)
+                            return
+                    except KeychainError:
+                        pass
                 # Check discovery even when stale descriptors keep yielding bytes.
                 if now - last_port_check >= 1.0:
                     last_port_check = now
@@ -766,13 +919,15 @@ def serve_port(
                             heartbeat_sent_at = None
                             last_heartbeat = now
                         continue
+                    if screen_only:
+                        continue
                     if isinstance(pairing_key, LivePairingKey):
                         if line.startswith("PROOF "):
                             if (not proof_expected or now >= proof_deadline
                                     or not hmac.compare_digest(line[6:], proof_expected)):
                                 continue
                             line, pending_event, proof_expected = pending_event, "", ""
-                            if not secure_keyboard_entry():
+                            if not secure_keyboard_entry() or screen_state() not in {"LOCKED", "SECURE"}:
                                 diagnostic("protocol.event_rejected", level="warning", reason="secure_input_required")
                                 continue
                         elif line.startswith(("EV ", "EV2 ")):
@@ -904,8 +1059,9 @@ def check_credentials(*, include_saved: bool = False) -> None:
 
 
 class Worker:
-    def __init__(self, endpoint: DeviceEndpoint):
+    def __init__(self, endpoint: DeviceEndpoint, screen_only: bool = False):
         self.endpoint = endpoint
+        self.screen_only = screen_only
         self.stop_event = threading.Event()
         self.error: BaseException | None = None
         self.planned_stop = False
@@ -923,6 +1079,7 @@ class Worker:
                 self.endpoint.port,
                 stop_event=self.stop_event,
                 device_id=self.endpoint.device_id,
+                screen_only=self.screen_only,
             )
         except Exception as exc:
             # Tracebacks retain worker frames, serial objects, and password maps.
@@ -932,6 +1089,10 @@ class Worker:
             self.error = exc
             self.phase = WorkerPhase.FAILED
         else:
+            # A screen-only worker returns when credentials appear. Restart it
+            # promptly with password support instead of counting a failure.
+            if self.screen_only:
+                self.planned_stop = True
             self.phase = WorkerPhase.STOPPED
 
     def start(self) -> None:
@@ -1089,17 +1250,21 @@ def _manage_workers(workers: dict[str, Worker]) -> None:
                 )
                 continue
             if not configured:
-                diagnostic("worker.credentials_missing", level="warning", device_id=device_id)
-                # The login Keychain can briefly report no items while macOS
-                # finishes opening the user's session. Check again promptly.
-                retry_after[device_id] = now + KEYCHAIN_RETRY_SECONDS
-                continue
-            worker = Worker(endpoint)
+                # PIV mode has no HID credentials but still needs screen reports.
+                # The login Keychain can also briefly report no items while
+                # macOS opens the session; the worker rechecks and restarts.
+                diagnostic("worker.credentials_missing", device_id=device_id)
+            worker = Worker(endpoint, screen_only=not configured)
             workers[device_id] = worker
             worker.start()
             retry_after.pop(device_id, None)
-            diagnostic("worker.started", device_id=device_id, port=endpoint.port)
-        time.sleep(0.1)
+            diagnostic(
+                "worker.started",
+                device_id=device_id,
+                port=endpoint.port,
+                screen_only=not configured,
+            )
+        time.sleep(0.1 if endpoints or workers else 1.0)
 
 
 def run(port: str | None, once: bool) -> None:

@@ -8,6 +8,7 @@ import threading
 import unittest
 from collections import deque
 from contextlib import ExitStack, contextmanager
+from itertools import product
 from pathlib import Path
 from unittest import mock
 
@@ -29,6 +30,20 @@ def event_frame(version=1, nonce=NONCE):
     material = f"EV2|{key_id}|{nonce}|1|2|99"
     return f"EV2 {nonce} 1 2 99 {key_id}:{helper.mac_hex(KEY, material)}\n".encode()
 
+
+
+_screen_patch = None
+
+
+def setUpModule():
+    # Serial transcripts below predate screen reports. ScreenReportTests cover them.
+    global _screen_patch
+    _screen_patch = mock.patch.object(helper, "screen_state", return_value=None)
+    _screen_patch.start()
+
+
+def tearDownModule():
+    _screen_patch.stop()
 
 class Clock:
     def __init__(self):
@@ -193,8 +208,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
                 self.assertFalse(any(key))
 
     def test_firmware_pong_formats_keep_idle_transport_alive(self):
-        for pong in (b"PONG\n", b"PONG 6\n"):
-            with self.subTest(pong=pong):
+        for pong, screen_only in product((b"PONG\n", b"PONG 6\n"), (False, True)):
+            with self.subTest(pong=pong, screen_only=screen_only):
                 stopped = threading.Event()
                 connection = Connection(Clock(), [b"OK STATUS protocol=6\n"])
 
@@ -211,8 +226,8 @@ class WatchdogRecoveryTests(unittest.TestCase):
                     return original_read(size)
 
                 connection.read = read
-                with serving(connection):
-                    helper.serve_port(PORT, stop_event=stopped, device_id=DEVICE_ID)
+                with serving(connection), mock.patch.object(helper, "credentials_exist", return_value=False):
+                    helper.serve_port(PORT, stop_event=stopped, device_id=DEVICE_ID, screen_only=screen_only)
                 self.assertGreaterEqual(connection.written.count(b"PING\n"), 2)
                 self.assertTrue(connection.closed)
 
@@ -263,8 +278,12 @@ class WatchdogRecoveryTests(unittest.TestCase):
             return secure
 
         connection.on_write = respond
-        with serving(connection), mock.patch.object(helper, "secure_keyboard_entry", side_effect=check_secure_input), mock.patch.object(
-            helper, "pairing_keychain_get", return_value=helper.LivePairingKey(KEY)
+        with (
+            serving(connection),
+            mock.patch.object(helper, "secure_keyboard_entry", return_value=True),
+            mock.patch.object(helper, "screen_state", side_effect=lambda: "SECURE" if check_secure_input() else "UNLOCKED"),
+            mock.patch.object(helper.ScreenReporter, "poll"),
+            mock.patch.object(helper, "pairing_keychain_get", return_value=helper.LivePairingKey(KEY)),
         ):
             helper.serve_port(PORT, once=True, stop_event=stop, device_id=DEVICE_ID)
         self.assertEqual([line.split()[0] for line in connection.written],
@@ -417,8 +436,9 @@ class EndManager(Exception):
 
 
 class ManagedWorker:
-    def __init__(self, endpoint, *, finish_on_stop=True):
+    def __init__(self, endpoint, *, finish_on_stop=True, screen_only=False):
         self.endpoint = endpoint
+        self.screen_only = screen_only
         self.error = None
         self.started_at = 0.0
         self.planned_stop = False
@@ -442,8 +462,8 @@ class ManagerRecoveryTests(unittest.TestCase):
         clock = Clock()
         workers = []
 
-        def create(endpoint):
-            worker = ManagedWorker(endpoint)
+        def create(endpoint, screen_only=False):
+            worker = ManagedWorker(endpoint, screen_only=screen_only)
             workers.append(worker)
             return worker
 
@@ -460,6 +480,13 @@ class ManagerRecoveryTests(unittest.TestCase):
             mock.patch.object(helper, "diagnostic"),
         ):
             yield workers
+
+    def test_discovery_slows_down_only_when_empty(self):
+        endpoint = helper.DeviceEndpoint(DEVICE_ID, PORT, "1-1")
+        with self.manager([[], [endpoint], EndManager()]), mock.patch.object(helper.time, "sleep") as sleep:
+            with self.assertRaises(EndManager):
+                helper._manage_workers({})
+        self.assertEqual(sleep.call_args_list, [mock.call(1.0), mock.call(0.1)])
 
     def test_port_or_location_change_replaces_worker_for_same_identity(self):
         old = helper.DeviceEndpoint(DEVICE_ID, PORT, "1-1")
@@ -531,17 +558,48 @@ class ManagerRecoveryTests(unittest.TestCase):
                 with self.assertRaises(EndManager):
                     helper._manage_workers({})
         self.assertEqual(credentials.call_count, 2)
-        self.assertEqual([worker.endpoint for worker in workers], [endpoint])
+        self.assertEqual(
+            [(worker.endpoint, worker.screen_only) for worker in workers],
+            [(endpoint, True), (endpoint, False)],
+        )
 
-    def test_missing_credentials_are_rechecked_without_process_restart(self):
+    def test_missing_credentials_start_a_screen_only_worker(self):
         endpoint = helper.DeviceEndpoint(DEVICE_ID, PORT, "1-1")
         scans = [[endpoint]] * 8 + [EndManager()]
         with self.manager(scans) as workers:
-            with mock.patch.object(helper, "credentials_exist", side_effect=[False, True]) as credentials:
+            with mock.patch.object(helper, "credentials_exist", return_value=False) as credentials:
                 with self.assertRaises(EndManager):
                     helper._manage_workers({})
-        self.assertEqual(credentials.call_count, 2)
-        self.assertEqual([worker.endpoint for worker in workers], [endpoint])
+        self.assertEqual(credentials.call_count, 1)
+        self.assertEqual(
+            [(worker.endpoint, worker.screen_only) for worker in workers], [(endpoint, True)]
+        )
+
+    def test_screen_only_worker_is_replaced_once_credentials_exist(self):
+        endpoint = helper.DeviceEndpoint(DEVICE_ID, PORT, "1-1")
+        scans = 0
+        with self.manager([]) as workers:
+            def discover():
+                nonlocal scans
+                scans += 1
+                if scans == 2:
+                    # A screen-only worker returns as a planned stop once credentials appear.
+                    workers[0].planned_stop = True
+                    workers[0].alive = False
+                if scans == 4:
+                    raise EndManager()
+                return [endpoint]
+
+            with (
+                mock.patch.object(helper, "device_endpoints", side_effect=discover),
+                mock.patch.object(helper, "credentials_exist", side_effect=[False, True]),
+            ):
+                with self.assertRaises(EndManager):
+                    helper._manage_workers({})
+        self.assertEqual(
+            [(worker.endpoint, worker.screen_only) for worker in workers],
+            [(endpoint, True), (endpoint, False)],
+        )
 
     def test_replacement_waits_for_old_worker_to_release_transport(self):
         old = helper.DeviceEndpoint(DEVICE_ID, PORT, "1-1")

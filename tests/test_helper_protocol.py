@@ -3,6 +3,7 @@ import ctypes
 import hashlib
 import tempfile
 import threading
+from contextlib import contextmanager
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -14,6 +15,20 @@ spec = importlib.util.spec_from_file_location(
 helper = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(helper)
 
+
+
+_screen_patch = None
+
+
+def setUpModule():
+    # Serial transcripts below predate screen reports. ScreenReportTests cover them.
+    global _screen_patch
+    _screen_patch = mock.patch.object(helper, "screen_state", return_value=None)
+    _screen_patch.start()
+
+
+def tearDownModule():
+    _screen_patch.stop()
 
 class SerialFramingTests(unittest.TestCase):
     def test_event_glued_behind_a_truncated_one_is_recovered(self):
@@ -288,8 +303,8 @@ class WorkerStateMachineTests(unittest.TestCase):
         workers = []
         original_worker = helper.Worker
 
-        def worker_factory(endpoint):
-            worker = original_worker(endpoint)
+        def worker_factory(endpoint, screen_only=False):
+            worker = original_worker(endpoint, screen_only=screen_only)
             workers.append(worker)
             return worker
 
@@ -370,6 +385,7 @@ class WorkerStateMachineTests(unittest.TestCase):
             "/dev/cu.renumbered",
             stop_event=worker.stop_event,
             device_id="TT-001122334455",
+            screen_only=False,
         )
 
 
@@ -675,3 +691,155 @@ class HelperProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScreenReportTests(unittest.TestCase):
+    """PIV firmware types its PIN only when macOS expects a password."""
+
+    def session(self, flags, secure=False, field=True):
+        core_graphics, core_foundation = mock.Mock(), mock.Mock()
+        core_graphics.CGSessionCopyCurrentDictionary.return_value = 1 if flags is not None else None
+        keys = {}
+
+        def create(_allocator, name, _encoding):
+            keys[len(keys) + 100] = name
+            return len(keys) + 99
+
+        core_foundation.CFStringCreateWithCString.side_effect = create
+        core_foundation.CFGetTypeID.return_value = 3
+        core_foundation.CFBooleanGetTypeID.return_value = 3
+        # Represent each CFBoolean by an object whose value the getter reads back.
+        booleans = {}
+
+        def lookup(_session, key):
+            value = (flags or {}).get(keys[key])
+            if value is None:
+                return None
+            booleans[len(booleans) + 1] = value
+            return len(booleans)
+
+        core_foundation.CFDictionaryGetValue.side_effect = lookup
+        core_foundation.CFBooleanGetValue.side_effect = lambda value: booleans[value]
+        return mock.patch.multiple(
+            helper,
+            _session_libraries=mock.Mock(return_value=(core_graphics, core_foundation)),
+            secure_keyboard_entry=mock.Mock(return_value=secure),
+            secure_field_focused=mock.Mock(return_value=field),
+        )
+
+    def state(self, flags, secure=False, field=True):
+        with _screen_patch_paused(), self.session(flags, secure, field):
+            return helper.screen_state()
+
+    def test_only_active_console_may_report_locked(self):
+        self.assertEqual(
+            self.state({b"CGSSessionScreenIsLocked": True, b"kCGSSessionOnConsoleKey": True}),
+            "LOCKED",
+        )
+        self.assertEqual(self.state({b"kCGSSessionOnConsoleKey": False}), "UNLOCKED")
+
+    def test_unlocked_session_reports_whether_a_password_field_has_focus(self):
+        flags = {b"kCGSSessionOnConsoleKey": True}
+        self.assertEqual(self.state(flags), "UNLOCKED")
+        self.assertEqual(self.state(flags, secure=True), "SECURE")
+
+        self.assertEqual(self.state(flags, secure=True, field=False), "UNLOCKED")
+
+    def test_missing_session_or_console_flag_blocks_typing(self):
+        self.assertEqual(self.state(None), "UNLOCKED")
+        self.assertEqual(self.state({b"CGSSessionScreenIsLocked": True}), "UNLOCKED")
+
+    def test_accessibility_focus_requires_trust_and_secure_subrole(self):
+        for trusted, subrole in ((False, None), (True, None), (True, 12), (True, 13)):
+            with self.subTest(trusted=trusted, subrole=subrole):
+                ax, cf = mock.Mock(), mock.Mock()
+                ax.AXIsProcessTrusted.return_value = trusted
+                ax.AXUIElementCreateSystemWide.return_value = 3
+                ax.AXUIElementSetMessagingTimeout.return_value = 0
+                cf.CFStringCreateWithCString.side_effect = (
+                    lambda _, name, encoding: {b"AXFocusedUIElement": 5, b"AXSubrole": 6, b"AXSecureTextField": 12}[name]
+                )
+                refs = []
+                def copy(element, key, result):
+                    value = {(3, 5): 8, (8, 6): subrole}[element, key]
+                    if value is None:
+                        return -25205
+                    ctypes.cast(result, ctypes.POINTER(ctypes.c_void_p))[0] = value
+                    return 0
+                ax.AXUIElementCopyAttributeValue.side_effect = copy
+                cf.CFEqual.side_effect = lambda actual, expected: actual == expected
+                cf.CFRelease.side_effect = refs.append
+                with mock.patch.object(helper, "_accessibility_libraries", return_value=(ax, cf)):
+                    self.assertEqual(helper.secure_field_focused(), trusted and subrole == 12)
+                expected = ([12, subrole] if subrole else []) + [6, 8, 5, 3] if trusted else []
+                self.assertEqual(refs, expected)
+
+    def test_reports_on_change_and_as_a_heartbeat(self):
+        connection = mock.Mock()
+        reporter = helper.ScreenReporter()
+        states = iter(["LOCKED", "LOCKED", "UNLOCKED", None, "UNLOCKED", "UNLOCKED"])
+        with mock.patch.object(helper, "screen_state", side_effect=lambda: next(states)):
+            for now in (0.0, 0.1, 0.2, 0.4, 0.6, 2.2, 2.3, 4.3):
+                reporter.poll(connection, now)
+        self.assertEqual(
+            [call.args[0] for call in connection.write.call_args_list],
+            [b"SCREEN LOCKED\n", b"SCREEN UNLOCKED\n", b"SCREEN UNLOCKED\n"],
+        )
+
+    def test_screen_only_worker_never_reads_credentials_or_answers_events(self):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        stopped = threading.Event()
+        reads = iter([b"EV2 " + b"ab" * 16 + b" 1 2 99 00\n"])
+
+        def read(_ser):
+            try:
+                return next(reads)
+            except StopIteration:
+                stopped.set()
+                return b""
+
+        with (
+            _screen_patch_paused(),
+            mock.patch.object(helper, "screen_state", return_value="LOCKED"),
+            mock.patch.object(helper, "open_serial", return_value=connection),
+            mock.patch.object(helper, "require_startup_status", return_value=[]),
+            mock.patch.object(helper, "read_available", side_effect=read),
+            mock.patch.object(helper, "device_ports", return_value=["/dev/cu.fake"]),
+            mock.patch.object(helper, "credentials_exist", return_value=False),
+            mock.patch.object(helper, "load_passwords") as passwords,
+            mock.patch.object(helper, "pairing_keychain_get") as pairing,
+            mock.patch.object(helper, "REATTACHED_DEVICES", ["TT-001122334455"]),
+        ):
+            helper.serve_port(
+                "/dev/cu.fake", stop_event=stopped, device_id="TT-001122334455", screen_only=True
+            )
+        passwords.assert_not_called()
+        pairing.assert_not_called()
+        writes = [call.args[0] for call in connection.write.call_args_list]
+        self.assertEqual(writes, [b"SCREEN LOCKED\n"])
+
+    def test_screen_only_worker_returns_when_credentials_appear(self):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        clock = iter(float(second) for second in range(100))
+        with (
+            mock.patch.object(helper.time, "monotonic", side_effect=lambda: next(clock)),
+            mock.patch.object(helper, "open_serial", return_value=connection),
+            mock.patch.object(helper, "require_startup_status", return_value=[]),
+            mock.patch.object(helper, "read_available", return_value=b""),
+            mock.patch.object(helper, "device_ports", return_value=["/dev/cu.fake"]),
+            mock.patch.object(helper, "credentials_exist", side_effect=[False, True]) as credentials,
+            mock.patch.object(helper, "REATTACHED_DEVICES", ["TT-001122334455"]),
+        ):
+            helper.serve_port("/dev/cu.fake", device_id="TT-001122334455", screen_only=True)
+        self.assertEqual(credentials.call_count, 2)
+
+
+@contextmanager
+def _screen_patch_paused():
+    _screen_patch.stop()
+    try:
+        yield
+    finally:
+        _screen_patch.start()

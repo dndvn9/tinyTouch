@@ -74,6 +74,37 @@ void touch_pin_hid_send_logs(void) {
   config_console_send_line("OK LOGS");
 }
 
+// The helper reports whether macOS expects a password: the screen is locked,
+// the login window is showing, or a secure (password) field has focus. Reports
+// are advisory. Without a helper, such as at the startup login window, PIV
+// entry keeps working as before.
+static host_screen_t host_screen;
+static int64_t host_screen_at;
+static portMUX_TYPE host_screen_lock = portMUX_INITIALIZER_UNLOCKED;
+
+bool touch_pin_hid_set_host_screen(const char *state) {
+  host_screen_t next;
+  if (strcmp(state, "LOCKED") == 0 || strcmp(state, "SECURE") == 0) next = HOST_SCREEN_PASSWORD;
+  else if (strcmp(state, "UNLOCKED") == 0) next = HOST_SCREEN_UNLOCKED;
+  else return false;
+  taskENTER_CRITICAL(&host_screen_lock);
+  bool changed = host_screen != next;
+  host_screen = next;
+  host_screen_at = esp_timer_get_time();
+  taskEXIT_CRITICAL(&host_screen_lock);
+  // Log changes only. The helper repeats its report every 2 s.
+  if (changed) touch_pin_hid_log_event("host_screen", next);
+  return true;
+}
+
+static host_screen_t host_screen_report(int64_t *reported_at) {
+  taskENTER_CRITICAL(&host_screen_lock);
+  host_screen_t state = host_screen;
+  *reported_at = host_screen_at;
+  taskEXIT_CRITICAL(&host_screen_lock);
+  return state;
+}
+
 static void secure_wipe(void *data, size_t length) {
   volatile uint8_t *cursor = data;
   while (length--) *cursor++ = 0;
@@ -177,10 +208,6 @@ failed:
     (void)send_hid_report(0, NULL, session);
   }
   return false;
-}
-
-static bool type_ascii(const uint8_t *data, size_t length) {
-  return type_ascii_in_session(data, length, hid_session_id());
 }
 
 static void bytes_to_hex(const uint8_t *data, size_t length, char *output) {
@@ -517,32 +544,95 @@ typedef struct {
   bool presence_armed;
 } auth_runtime_t;
 
-// A sleeping display can leave USB fully active. Wake it with a modifier
-// press and release before inserting the card into the macOS login session.
+// One verified touch must wake a sleeping Mac, light its display and insert
+// the card, like a built-in Touch ID sensor. A Mac waking from sleep may reset
+// or remount USB, so follow the current connection instead of abandoning it.
 static bool prepare_piv_touch(void) {
+  const TickType_t wake_timeout = pdMS_TO_TICKS(20000);
+  const TickType_t wake_retry = pdMS_TO_TICKS(2000);
   if (!usb_ccid_touch_enabled()) return true;
-  uint32_t session = hid_session_id();
-  if (!usb_ccid_piv_visible()) {
-    if (!tud_mounted()) return false;
+  if (!tud_mounted() && !tud_suspended()) return false;
+  usb_ccid_defer_reconnect_for_touch();
+  TickType_t start = xTaskGetTickCount();
+  TickType_t wake_requested_at = 0;
+  bool wake_requested = false;
+  while (device_config_mode() == DEVICE_MODE_PIV &&
+         xTaskGetTickCount() - start < wake_timeout) {
+    TickType_t now = xTaskGetTickCount();
     if (tud_suspended()) {
-      if (!tud_remote_wakeup()) return false;
-      TickType_t start = xTaskGetTickCount();
-      while (tud_suspended()) {
-        if (hid_session_id() != session ||
-            xTaskGetTickCount() - start >= pdMS_TO_TICKS(2000)) return false;
-        vTaskDelay(pdMS_TO_TICKS(10));
+      // macOS can miss a resume signal while it is still entering sleep.
+      if (!wake_requested || now - wake_requested_at >= wake_retry) {
+        if (!tud_remote_wakeup() && tud_suspended()) return false;
+        wake_requested = true;
+        wake_requested_at = now;
       }
+    } else if (tud_mounted() && tud_hid_ready()) {
+      uint32_t session = hid_session_id();
+      // Even a visible card on an active bus can have a sleeping login screen.
+      if (!send_key(KEYBOARD_MODIFIER_LEFTSHIFT, 0, session)) {
+        if (session == hid_session_id()) return false;
+        continue;
+      }
+      touch_pin_hid_log_event("piv_wake_sent", 0);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      if (session == hid_session_id() && tud_mounted() && !tud_suspended() &&
+          device_config_mode() == DEVICE_MODE_PIV) {
+        usb_ccid_touch_begin();
+        return true;
+      }
+      // The host replaced the connection while waking. Retry on the new one.
+      continue;
     }
-    if (!send_key(KEYBOARD_MODIFIER_LEFTSHIFT, 0, session)) return false;
-    touch_pin_hid_log_event("piv_wake_sent", 0);
-    // USB acknowledges the key before loginwindow finishes waking the display.
-    // This settling time is independent of the configured post-selection PIN delay.
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
-  if (session != hid_session_id() || !tud_mounted() || tud_suspended() ||
-      device_config_mode() != DEVICE_MODE_PIV) return false;
-  usb_ccid_touch_begin();
-  return true;
+  return false;
+}
+
+static bool wait_for_piv_pin(uint32_t session) {
+  if (!usb_ccid_touch_enabled()) return true;
+  int64_t pin_due = esp_timer_get_time() + (int64_t)device_config_piv_delay_ms() * 1000;
+  while (hid_session_id() == session && device_config_mode() == DEVICE_MODE_PIV &&
+         !tud_suspended() && usb_ccid_touch_ready() && !fingerprint_prompted_authorization_active()) {
+    if (esp_timer_get_time() < pin_due) {
+      vTaskDelay(1);
+    } else if (fingerprint_present_hint() && device_config_options().piv_auto_type) {
+      // macOS does not report focus over USB. A held finger lets the user wait for the PIN field.
+      fingerprint_wait_for_touch();
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The helper reports every 2 s while connected. A recent report means it is
+// running and its answer must be awaited after the card reconnects USB.
+#define HOST_SCREEN_ACTIVE_US (6LL * 1000000)
+#define HOST_SCREEN_WAIT_US (3LL * 1000000)
+
+static bool host_screen_unlocked_now(int64_t touched_at, bool *reporter_active) {
+  int64_t reported_at;
+  host_screen_t screen = host_screen_report(&reported_at);
+  *reporter_active = screen != HOST_SCREEN_NONE &&
+                     touched_at - reported_at <= HOST_SCREEN_ACTIVE_US;
+  return *reporter_active && screen == HOST_SCREEN_UNLOCKED;
+}
+
+// Type only into a password field. Waking the Mac or inserting the card can
+// change its state, so require a report made after this touch began.
+static bool piv_entry_allowed(int64_t touched_at, bool reporter_active, uint32_t session) {
+  int64_t deadline = esp_timer_get_time() + HOST_SCREEN_WAIT_US;
+  while (hid_session_id() == session) {
+    int64_t reported_at;
+    host_screen_t screen = host_screen_report(&reported_at);
+    if (screen == HOST_SCREEN_NONE) return true;
+    if (reported_at >= touched_at) return screen == HOST_SCREEN_PASSWORD;
+    // A helper that was silent before the touch may have exited, such as after
+    // logout. A helper that was reporting must confirm the current state.
+    if (esp_timer_get_time() >= deadline) return !reporter_active;
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  return false;
 }
 
 static void handle_fingerprint_match(fingerprint_match_t match) {
@@ -555,20 +645,40 @@ static void handle_fingerprint_match(fingerprint_match_t match) {
     // The PIV applet accepts this PIN. Emit it only after a verified background
     // fingerprint match, so the macOS smart-card PIN field can complete login.
     static const uint8_t piv_pin[] = {'1', '1', '1', '1', '1', '1'};
-    if (!prepare_piv_touch() || !usb_ccid_wait_for_piv()) {
+    int64_t touched_at = esp_timer_get_time();
+    bool reporter_active;
+    if (host_screen_unlocked_now(touched_at, &reporter_active)) {
+      // An unlocked Mac has no login PIN field. Wake the display like Touch ID,
+      // but never insert the card or type into the focused app.
+      if (usb_ccid_touch_enabled()) (void)send_key(KEYBOARD_MODIFIER_LEFTSHIFT, 0, hid_session_id());
+      else piv_note_user_presence();
+      touch_pin_hid_log_event("piv_touch_unlocked", match.slot);
+      return;
+    }
+    bool discovered = prepare_piv_touch() && usb_ccid_wait_for_piv();
+    // Showing the card can reconnect USB. Bind PIN entry to the session after discovery.
+    uint32_t session = hid_session_id();
+    if (!discovered || !wait_for_piv_pin(session)) {
       usb_ccid_touch_cancel();
-      touch_pin_hid_log_event("piv_discovery_timeout", match.slot);
+      touch_pin_hid_log_event(discovered ? "piv_entry_cancelled" : "piv_discovery_timeout", match.slot);
+      return;
+    }
+    bool auto_type = device_config_options().piv_auto_type;
+    if (auto_type && !piv_entry_allowed(touched_at, reporter_active, session)) {
+      // The focused field is not a password field. Hide the card and type nothing.
+      usb_ccid_touch_cancel();
+      touch_pin_hid_log_event("piv_entry_blocked", match.slot);
       return;
     }
     ESP_LOGI(TAG, "finger matched; authorizing and completing PIV login");
     // Re-enumeration resets transport authorization. Grant presence only
     // after enumeration and discovery have completed.
     piv_note_user_presence();
-    if (!device_config_options().piv_auto_type) {
+    if (!auto_type) {
       touch_pin_hid_log_event("piv_presence_granted", match.slot);
       return;
     }
-    bool typed = type_ascii(piv_pin, sizeof(piv_pin));
+    bool typed = type_ascii_in_session(piv_pin, sizeof(piv_pin), session);
     touch_pin_hid_log_event(typed ? "piv_pin_typed" : "piv_pin_failed", match.slot);
     if (!typed) ESP_LOGW(TAG, "PIV PIN typing failed");
   }

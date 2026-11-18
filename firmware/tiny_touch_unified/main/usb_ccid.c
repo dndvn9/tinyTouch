@@ -37,6 +37,7 @@ static bool touch_enabled;
 static bool piv_exposed;
 static bool piv_selected;
 static bool reconnect_requested;
+static bool touch_waking;
 static bool login_response_pending;
 static int64_t touch_until;
 static int64_t setup_until;
@@ -62,6 +63,7 @@ static void reconnect_on_usb_task(void *argument) {
   taskENTER_CRITICAL(&policy_lock);
   piv_exposed = expose;
   piv_selected = false;
+  reconnect_requested = false;
   login_response_pending = false;
   taskEXIT_CRITICAL(&policy_lock);
   tud_connect();
@@ -79,8 +81,8 @@ static void update_usb_policy(void) {
   bool piv_mode = device_config_mode() == DEVICE_MODE_PIV;
   taskENTER_CRITICAL(&policy_lock);
   bool expose = !touch_enabled || (piv_mode && (now < touch_until || now < setup_until));
-  bool reconnect = reconnect_requested || expose != piv_exposed;
-  reconnect_requested = false;
+  // A resume rescan and the insertion promised by the same touch share one reconnect.
+  bool reconnect = !touch_waking && (reconnect_requested || expose != piv_exposed);
   taskEXIT_CRITICAL(&policy_lock);
   if (!reconnect) {
     xSemaphoreGive(console_mutex);
@@ -210,8 +212,11 @@ static void handle_message(uint8_t *msg, size_t msg_len) {
         if (queued && len >= 2 && msg[11] == 0xa4 && resp_len >= 2 &&
             tx_buf[10 + resp_len - 2] == 0x90 && tx_buf[10 + resp_len - 1] == 0x00) {
           taskENTER_CRITICAL(&policy_lock);
+          bool first_selection = !piv_selected;
           piv_selected = true;
           taskEXIT_CRITICAL(&policy_lock);
+          // Time from selection to a working PIN field is what piv_delay_ms covers.
+          if (first_selection) touch_pin_hid_log_event("piv_selected", 0);
         }
       }
       break;
@@ -232,6 +237,8 @@ static void ccid_reset(uint8_t rhport) {
   in_zlp_pending = false;
   rx_length = 0;
   taskENTER_CRITICAL(&policy_lock);
+  // A Mac can reset the bus while waking. Keep a touch's deferred reconnect;
+  // the touch always ends with usb_ccid_touch_begin() or usb_ccid_touch_cancel().
   piv_selected = false;
   login_response_pending = false;
   taskEXIT_CRITICAL(&policy_lock);
@@ -398,9 +405,16 @@ bool usb_ccid_piv_visible(void) {
   return exposed;
 }
 
+void usb_ccid_defer_reconnect_for_touch(void) {
+  taskENTER_CRITICAL(&policy_lock);
+  touch_waking = true;
+  taskEXIT_CRITICAL(&policy_lock);
+}
+
 void usb_ccid_touch_begin(void) {
   if (!touch_enabled || device_config_mode() != DEVICE_MODE_PIV) return;
   taskENTER_CRITICAL(&policy_lock);
+  touch_waking = false;
   touch_until = esp_timer_get_time() + TOUCH_WINDOW_US;
   login_response_pending = false;
   taskEXIT_CRITICAL(&policy_lock);
@@ -408,6 +422,7 @@ void usb_ccid_touch_begin(void) {
 
 void usb_ccid_touch_cancel(void) {
   taskENTER_CRITICAL(&policy_lock);
+  touch_waking = false;
   touch_until = 0;
   login_response_pending = false;
   taskEXIT_CRITICAL(&policy_lock);
@@ -420,27 +435,22 @@ void usb_ccid_login_complete(void) {
   taskEXIT_CRITICAL(&policy_lock);
 }
 
+bool usb_ccid_touch_ready(void) {
+  taskENTER_CRITICAL(&policy_lock);
+  bool ready = !reconnect_requested && piv_exposed && piv_selected &&
+               esp_timer_get_time() < touch_until;
+  taskEXIT_CRITICAL(&policy_lock);
+  return ready && tud_mounted() && tud_hid_ready();
+}
+
 bool usb_ccid_wait_for_piv(void) {
   if (!touch_enabled) return true;
-  int64_t deadline = esp_timer_get_time() + 8000000;
-  while (esp_timer_get_time() < deadline) {
+  while (device_config_mode() == DEVICE_MODE_PIV) {
     taskENTER_CRITICAL(&policy_lock);
-    bool ready = piv_exposed && piv_selected && esp_timer_get_time() < touch_until;
+    bool active = esp_timer_get_time() < touch_until;
     taskEXIT_CRITICAL(&policy_lock);
-    if (device_config_mode() != DEVICE_MODE_PIV) return false;
-    if (ready && tud_mounted() && tud_hid_ready()) {
-      // Wait for the login UI to switch fields after PIV selection. This
-      // saved delay does not replace enumeration and HID readiness checks.
-      uint16_t delay_ms = device_config_piv_delay_ms();
-      // Use elapsed time so the scheduler cannot round 25 ms down to 20 ms.
-      int64_t pin_deadline = esp_timer_get_time() + (int64_t)delay_ms * 1000;
-      while (esp_timer_get_time() < pin_deadline) vTaskDelay(1);
-      taskENTER_CRITICAL(&policy_lock);
-      ready = piv_exposed && piv_selected && esp_timer_get_time() < touch_until;
-      taskEXIT_CRITICAL(&policy_lock);
-      return ready && device_config_mode() == DEVICE_MODE_PIV &&
-             tud_mounted() && tud_hid_ready();
-    }
+    if (!active) return false;
+    if (usb_ccid_touch_ready()) return true;
     vTaskDelay(pdMS_TO_TICKS(10));
   }
   return false;

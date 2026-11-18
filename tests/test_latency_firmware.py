@@ -47,11 +47,11 @@ class FirmwareLatencyTests(unittest.TestCase):
             "submit": section(source, "bool touch_pin_hid_submit_response(", "uint8_t const *tud_hid_descriptor_report_cb("),
         })
 
-    def test_piv_wake_before_card_insertion(self):
+    def test_piv_wake_and_pin_entry(self):
         source = (MAIN / "touch_pin_hid.c").read_text()
         self.run_harness("piv_wake_test.c", {
             "prepare": section(source, "static bool prepare_piv_touch(",
-                               "static void handle_fingerprint_match("),
+                               "static void auth_wait_for_lift("),
         })
 
     def test_touch_edges_capture_retries_and_foreground_pause(self):
