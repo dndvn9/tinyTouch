@@ -34,7 +34,7 @@ static bool fingerprint_recover(void) { sensor_ready = true; return true; }
 static void fingerprint_wait_for_touch(void) { vTaskDelay(1); }
 static int device_config_touch_cooldown_ms(void) { return 50; }
 static void touch_pin_hid_log_event(const char *event, int value) { (void)event; (void)value; }
-static void usb_ccid_touch_begin(void) { begins++; }
+void usb_ccid_touch_begin(void) { begins++; }
 static void usb_ccid_touch_cancel(void) { cancels++; }
 static bool fingerprint_try_poll_match(fingerprint_match_t *match) {
   attempts++; *match = (fingerprint_match_t){0};
@@ -67,7 +67,7 @@ int main(void) {
   // Fresh presence starts matching independently of USB endpoint polling.
   // Busy UART/image-not-ready retries do not consume the touch edge.
   reset(); retry_count = 3; run();
-  assert(attempts == 4 && matches == 1 && begins == 1 && cancels == 0);
+  assert(attempts == 4 && matches == 1 && begins == 0 && cancels == 0);
 
   // One completed mismatch consumes the edge even with a held finger.
   reset(); mismatch = true; run();

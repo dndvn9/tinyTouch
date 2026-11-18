@@ -114,13 +114,15 @@ Firmware 0.1.34 includes `tinytouch piv-touch on`. After authorizing the change,
 unplug and reconnect tinyTouch. PIV mode then hides its smart-card interface
 while idle, so macOS can offer password entry at the login or lock screen.
 
-Touching the sensor exposes the card for up to 20 seconds. A matching
-fingerprint is still required to use the private key. The card hides after the
-login and Login Keychain operations finish transferring their responses to
-macOS, or after a failed match. Login takes slightly longer because macOS must
-discover the card before the device types its dummy PIN. The timeout returns to
-password entry if login does not complete. Configuration commands and firmware
-transfers finish before an automatic USB reconnect.
+With firmware 0.1.37, a matching fingerprint starts the wake sequence. When
+the card is hidden, tinyTouch requests USB remote wake if the bus is suspended,
+sends and releases the left Shift modifier, then waits one second before
+exposing the card for up to 20 seconds. A host that declines remote wake needs
+to be woken separately. The device log records a completed wake report as
+`piv_wake_sent`. The Mac controls when the PIN field is ready and visible.
+After card discovery, tinyTouch grants the matching touch for PIV operations.
+The card hides again after login and Login Keychain responses complete or the
+visibility window expires.
 
 The setting is off by default, survives reconnects, and does not change HID
 authentication. Run `tinytouch piv-touch off`, then unplug and reconnect, to

@@ -517,6 +517,34 @@ typedef struct {
   bool presence_armed;
 } auth_runtime_t;
 
+// A sleeping display can leave USB fully active. Wake it with a modifier
+// press and release before inserting the card into the macOS login session.
+static bool prepare_piv_touch(void) {
+  if (!usb_ccid_touch_enabled()) return true;
+  uint32_t session = hid_session_id();
+  if (!usb_ccid_piv_visible()) {
+    if (!tud_mounted()) return false;
+    if (tud_suspended()) {
+      if (!tud_remote_wakeup()) return false;
+      TickType_t start = xTaskGetTickCount();
+      while (tud_suspended()) {
+        if (hid_session_id() != session ||
+            xTaskGetTickCount() - start >= pdMS_TO_TICKS(2000)) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+      }
+    }
+    if (!send_key(KEYBOARD_MODIFIER_LEFTSHIFT, 0, session)) return false;
+    touch_pin_hid_log_event("piv_wake_sent", 0);
+    // USB acknowledges the key before loginwindow finishes waking the display.
+    // This settling time is independent of the configured post-selection PIN delay.
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  if (session != hid_session_id() || !tud_mounted() || tud_suspended() ||
+      device_config_mode() != DEVICE_MODE_PIV) return false;
+  usb_ccid_touch_begin();
+  return true;
+}
+
 static void handle_fingerprint_match(fingerprint_match_t match) {
   if (device_config_mode() == DEVICE_MODE_HID) {
     ESP_LOGI(TAG, "finger matched; requesting HID password");
@@ -527,7 +555,7 @@ static void handle_fingerprint_match(fingerprint_match_t match) {
     // The PIV applet accepts this PIN. Emit it only after a verified background
     // fingerprint match, so the macOS smart-card PIN field can complete login.
     static const uint8_t piv_pin[] = {'1', '1', '1', '1', '1', '1'};
-    if (!usb_ccid_wait_for_piv()) {
+    if (!prepare_piv_touch() || !usb_ccid_wait_for_piv()) {
       usb_ccid_touch_cancel();
       touch_pin_hid_log_event("piv_discovery_timeout", match.slot);
       return;
@@ -644,7 +672,6 @@ static void touch_hid_task(void *arg) {
       runtime.state = AUTH_STATE_CAPTURING;
       runtime.state_started = now;
       touch_pin_hid_log_event("touch_detected", 0);
-      usb_ccid_touch_begin();
     }
 
     fingerprint_match_t match;
