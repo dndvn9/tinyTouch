@@ -66,7 +66,7 @@ static void touch_pin_hid_log_event(const char *name, int value) {
   (void)name; (void)value;
 }
 static void usb_ccid_touch_begin(void) {
-  assert(keypresses >= 1 && now >= 1000);
+  assert(keypresses >= 1 && now >= 700);
   insertions++;
   expires_at = now + 20000;
 }
@@ -116,24 +116,24 @@ int main(void) {
   reset();
   assert(prepare_piv_touch() && insertions == 1 && !remote_requests);
   reset(); suspended = true; resume_at = 1500;
-  assert(prepare_piv_touch() && remote_requests == 1 && insertions == 1 && now == 2500);
+  assert(prepare_piv_touch() && remote_requests == 1 && insertions == 1 && now == 2200);
   // A resume request missed while the Mac enters sleep is repeated.
   reset(); suspended = true; resume_at = 4000;
-  assert(prepare_piv_touch() && remote_requests == 2 && insertions == 1 && now == 5000);
+  assert(prepare_piv_touch() && remote_requests == 2 && insertions == 1 && now == 4700);
   // A bus reset during wake moves the touch to the new connection.
   reset(); suspended = true; reset_at = 1500; hid_ready_at = 3000;
   assert(prepare_piv_touch() && remote_requests == 1 && keypresses == 1 && insertions == 1);
-  assert(now == 4000);
+  assert(now == 3700);
   // A Mac that is slow to poll HID after wake still gets the wake key.
   reset(); hid_ready_at = 5000;
-  assert(prepare_piv_touch() && keypresses == 1 && insertions == 1 && now == 6000);
+  assert(prepare_piv_touch() && keypresses == 1 && insertions == 1 && now == 5700);
   reset(); suspended = true; allow_wake = false;
   assert(!prepare_piv_touch() && !keypresses && !insertions);
   reset(); suspended = true;
   assert(!prepare_piv_touch() && now == 20000 && !insertions);
   // A reconnect while the display wakes repeats the wake key on the new session.
   reset(); disconnect_at = 500;
-  assert(prepare_piv_touch() && keypresses == 2 && insertions == 1 && now == 2000);
+  assert(prepare_piv_touch() && keypresses == 2 && insertions == 1 && now == 1400);
   reset(); hid_ready_at = 30000;
   assert(!prepare_piv_touch() && !keypresses && !insertions && now == 20000);
   reset(); send_ok = false;
@@ -146,15 +146,15 @@ int main(void) {
   for (size_t i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
     reset(); delay_ms = delays[i];
     handle_fingerprint_match(match);
-    assert(pin_entries == 1 && !cancels && now >= 1000 + (unsigned)delay_ms);
-    assert(now < 1010 + (unsigned)delay_ms);
+    assert(pin_entries == 1 && !cancels && now >= 700 + (unsigned)delay_ms);
+    assert(now < 710 + (unsigned)delay_ms);
   }
   reset(); lift_at = 7000;
   handle_fingerprint_match(match);
   assert(pin_entries == 1 && now == lift_at && !cancels);
   reset(); lift_at = 30000;
   handle_fingerprint_match(match);
-  assert(!pin_entries && !grants && cancels == 1 && now == 21000);
+  assert(!pin_entries && !grants && cancels == 1 && now == 20700);
   reset(); lift_at = 7000; disconnect_at = 3000;
   handle_fingerprint_match(match);
   assert(!pin_entries && !grants && cancels == 1 && now == 3000);
@@ -163,7 +163,7 @@ int main(void) {
   assert(!pin_entries && !grants && cancels == 1 && now == 3000);
   reset(); options.piv_auto_type = false; lift_at = 7000;
   handle_fingerprint_match(match);
-  assert(!pin_entries && grants == 1 && !cancels && now == 1050);
+  assert(!pin_entries && grants == 1 && !cancels && now == 750);
   reset(); enabled = false; lift_at = 7000;
   handle_fingerprint_match(match);
   assert(pin_entries == 1 && !insertions && now == 0);
@@ -183,7 +183,7 @@ int main(void) {
   // A helper that was reporting must confirm before keystrokes are sent.
   reset(); report(HOST_SCREEN_PASSWORD, 1000);
   handle_fingerprint_match(match);
-  assert(!pin_entries && !grants && cancels == 1 && now == 14050);
+  assert(!pin_entries && !grants && cancels == 1 && now == 13750);
   // Unlocking while the card is shown blocks entry.
   reset(); report(HOST_SCREEN_PASSWORD, 1000);
   next_screen = HOST_SCREEN_UNLOCKED; next_screen_at = 11500;
@@ -192,7 +192,7 @@ int main(void) {
   // A helper silent before the touch (asleep, or logged out) may be gone.
   reset(); report(HOST_SCREEN_UNLOCKED, 7000);
   handle_fingerprint_match(match);
-  assert(pin_entries == 1 && insertions == 1 && now == 14050);
+  assert(pin_entries == 1 && insertions == 1 && now == 13750);
   // A Mac that wakes unlocked reports so before the PIN is typed.
   reset(); report(HOST_SCREEN_UNLOCKED, 9000);
   next_screen = HOST_SCREEN_UNLOCKED; next_screen_at = 11800;
@@ -201,6 +201,6 @@ int main(void) {
   // Disabling automatic entry still grants presence without asking the helper.
   reset(); options.piv_auto_type = false; report(HOST_SCREEN_PASSWORD, 1000);
   handle_fingerprint_match(match);
-  assert(grants == 1 && !pin_entries && !cancels && now == 11050);
+  assert(grants == 1 && !pin_entries && !cancels && now == 10750);
   return 0;
 }

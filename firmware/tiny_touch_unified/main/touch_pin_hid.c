@@ -574,7 +574,7 @@ static bool prepare_piv_touch(void) {
         continue;
       }
       touch_pin_hid_log_event("piv_wake_sent", 0);
-      vTaskDelay(pdMS_TO_TICKS(1000));
+      vTaskDelay(pdMS_TO_TICKS(700));
       if (session == hid_session_id() && tud_mounted() && !tud_suspended() &&
           device_config_mode() == DEVICE_MODE_PIV) {
         usb_ccid_touch_begin();
